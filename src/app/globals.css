@@ -1,0 +1,5 @@
+@import "tailwindcss";
+
+:root{--bg:#f7f8fa;--ink:#19212c;--muted:#85909e;--line:#e8ebef;--purple:#6c5ce7;--teal:#23b89a;--sidebar:#fff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,"Segoe UI",sans-serif;font-size:14px}button,input{font:inherit}button{cursor:pointer}::selection{background:#e9e5ff;color:#4e40be}.mono{font-family:Consolas,monospace}.display{font-family:Inter,"Segoe UI",sans-serif}
+.scrollbar-hide::-webkit-scrollbar{display:none}.scrollbar-hide{-ms-overflow-style:none;scrollbar-width:none}
