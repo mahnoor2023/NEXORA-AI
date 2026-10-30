@@ -64,3 +64,13 @@ test("dataset routes preserve a selected dataset and expose reopen actions", () 
   assert.match(pages, /href=\{`\/datasets\/\$\{x\.dataset_id\}/);
   assert.match(nav, /href:\s*"\/new-analysis"/);
 });
+
+test("AI chat exposes provider states and cloud evidence processing before submission", () => {
+  const chat = readFileSync(join(sourceRoot, "components/ai-analyst-chat.tsx"), "utf8");
+  const types = readFileSync(join(sourceRoot, "types/dataset.ts"), "utf8");
+  assert.match(chat, /third-party cloud AI provider/);
+  assert.match(chat, /configured local Ollama service/);
+  assert.match(chat, /GROQ_API_KEY/);
+  assert.match(chat, /GroqCloud/);
+  assert.match(types, /"missing_credentials" \| "rate_limited" \| "unavailable" \| "request_failed"/);
+});

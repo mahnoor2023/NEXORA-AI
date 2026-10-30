@@ -17,7 +17,7 @@ Scope inspected: App Router pages, shared navigation/header, dashboard upload/re
 | Export preview | Working | Downloads only the displayed first 10 rows and escapes spreadsheet formula prefixes. |
 | Dataset cards and reopen | Working | Cards open the saved CSV by owner-checked dataset ID; the API verifies file size/hash and rebuilds analytics. Missing legacy sources request reupload. |
 | ML Studio | Working | Calls real training endpoint and displays comparison, metrics, predictions, and feature importance. Requires current CSV to be re-uploaded after browser/server restart. |
-| AI Analyst chat | Working when configured | Uses real Ollama tool calls and explicit unavailable/error states. Requires a compatible local model and current CSV upload. |
+| AI Analyst chat | Working when configured | Uses GroqCloud OpenAI-compatible function calls by default when `GROQ_API_KEY` is set; otherwise uses Ollama only when an installed local model is ready. Status includes missing credentials, rate-limited, unavailable, and request-failed states. Cloud chat discloses third-party evidence processing. |
 | Settings profile/password/preferences | Working | Persists to SQLite; password update rotates sessions; default page and compact-table preference are stored. |
 | Delete account | Working | Requires password and typed `DELETE`; database cascades remove sessions, metadata, preferences, and history. |
 | Dataset deletion | Working | Requires confirmation and deletes only the signed-in owner's row, CSV file, and history. |
@@ -33,7 +33,7 @@ Scope inspected: App Router pages, shared navigation/header, dashboard upload/re
 | `POST /api/v1/datasets/analyze` | Working | Authenticated, bounded CSV; computes analytics and saves owner-scoped metadata/aggregate history. |
 | `POST /api/v1/datasets/train` | Working | Authenticated; bounded, real ML pipeline; saves metrics summary only. |
 | `GET /api/v1/datasets`, `GET /active`, `GET /history`, `GET /{dataset_id}/analysis`, `GET /{dataset_id}/source`, `DELETE /{dataset_id}` | Working | Authenticated and owner-filtered. Reopen verifies bounded file size and SHA-256; delete removes the owner's file and history. |
-| `GET /api/v1/agent/status`, `POST /api/v1/agent/chat` | Working when configured | Authenticated; local Ollama only; bounded analysis tools, no arbitrary code execution. |
+| `GET /api/v1/agent/status`, `POST /api/v1/agent/chat` | Working when configured | Authenticated; GroqCloud by default when configured, optional Ollama fallback; bounded allowlisted tools, correlated tool call IDs, no arbitrary code execution. |
 
 ## Verification boundaries
 
@@ -44,4 +44,5 @@ Backend automated tests cover signup/login/logout, duplicate accounts, password/
 - SQLite is the implemented runtime. PostgreSQL is not yet a supported adapter; see the migration checklist in the README.
 - CSV content is retained as an immutable private file with 250 MB/100-dataset per-account and 2 GB local total defaults. Metadata-only records from earlier versions remain and explicitly require owner reupload.
 - Local Ollama was not available during this audit and no model was downloaded.
+- Hosted Groq inference was not live-tested. Automated tests use mocked provider responses; configure an authorized backend `GROQ_API_KEY` and review provider terms before any live request.
 - Browser-based end-to-end tests are not configured; automated UI confidence currently comes from lint, typecheck, build, and the API suite.

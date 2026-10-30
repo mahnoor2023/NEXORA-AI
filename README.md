@@ -1,18 +1,19 @@
 # NEXORA AI
 
-NEXORA AI is a local-first data analysis workspace built with Next.js, TypeScript, Tailwind CSS, FastAPI, Pandas, scikit-learn, and SQLite. It supports account signup/login, CSV profiling and safe cleaning, supervised baseline ML, an optional local Ollama analyst, and per-user analysis history.
+NEXORA AI is a full-stack data analysis workspace built with Next.js, TypeScript, FastAPI, Pandas, scikit-learn, and SQLAlchemy. It supports account signup/login, persistent owner-scoped CSV profiling and safe cleaning, supervised baseline ML, and a bounded AI analyst that can use GroqCloud or optional local Ollama. SQLite and private H: local file storage remain the development defaults; PostgreSQL and private S3-compatible storage are configurable for hosted environments.
 
 ## What persists
 
-User accounts, salted password hashes, session-token hashes, preferences, dataset metadata, and aggregate analysis/training history are stored in `runtime/nexora.sqlite3` by default. Validated original CSV files are stored immutably under `runtime/datasets/` with generated identifiers; paths are never returned to clients. Storage is limited to 250 MB and 100 datasets per account plus a 2 GB local total by default, configurable with `MAX_USER_DATASET_STORAGE_MB`, `MAX_DATASETS_PER_USER`, and `MAX_TOTAL_DATASET_STORAGE_MB`. Row previews, chat content, model artifacts, and ML test-set predictions are not persisted. Reopened datasets rebuild their analytics from the validated source file.
+User accounts, salted password hashes, session-token hashes, preferences, dataset metadata, and aggregate analysis/training history are stored in `runtime/nexora.sqlite3` by default. Set `DATABASE_URL` to PostgreSQL in production; otherwise the app uses SQLite and `DATABASE_PATH`. Idempotent, additive startup migrations preserve existing user and dataset rows. They do not copy a local SQLite database into a newly provisioned PostgreSQL database. Validated original CSV files use `runtime/datasets/` locally or a private S3-compatible bucket when `STORAGE_BACKEND=s3`; only generated UUID object keys are stored. Storage is limited to 250 MB and 100 datasets per account; the local backend also has a 2 GB total limit. Configure quotas with `MAX_USER_DATASET_STORAGE_MB`, `MAX_DATASETS_PER_USER`, and `MAX_TOTAL_DATASET_STORAGE_MB`. Row previews, chat content, model artifacts, and ML test-set predictions are not persisted. Reopened datasets rebuild their analytics from the validated source file.
 
-Passwords use PBKDF2-HMAC-SHA256 with per-account random salts. Sessions use random opaque tokens in HttpOnly, SameSite=Lax cookies; only token hashes are stored. Browser writes enforce the configured Origin allowlist. In production set `APP_ENV=production`, `COOKIE_SECURE=true`, HTTPS, and exact trusted `CORS_ORIGINS` values. Use an HTTPS reverse proxy and add rate limiting and monitoring before exposing the API publicly.
+Passwords use PBKDF2-HMAC-SHA256 with per-account random salts. Sessions use random opaque tokens in HttpOnly cookies; only token hashes are stored. Browser writes enforce the configured Origin allowlist. Production requires HTTPS, `COOKIE_SECURE=true`, `COOKIE_SAMESITE=none`, an exact `CORS_ORIGINS` allowlist, PostgreSQL, and S3-compatible storage. Use frontend and API custom domains under the same registrable domain (for example, `app.example.com` and `api.example.com`): they remain cross-origin but are same-site, which avoids many browsers' third-party-cookie blocking on unrelated Vercel and Render domains.
 
 ## Requirements
 
 - Node.js 20.9+
 - `uv` and Python 3.12
-- Ollama and an installed tool-calling model are optional. NEXORA does not download models and reports provider/model errors when unavailable.
+- Hosted Analyst Chat is optional and uses GroqCloud only when `GROQ_API_KEY` is configured on the backend. The default `GROQ_MODEL` is `openai/gpt-oss-20b`; Groq lists it as a production model with tool use and JSON mode. Confirm your account can access the selected model in the [Groq models documentation](https://console.groq.com/docs/models). No API key is required or accepted by the frontend.
+- Ollama and an already-installed local tool-calling model remain optional. NEXORA does not install Ollama or download models.
 
 ## Install on H:
 
@@ -31,12 +32,13 @@ uv pip install --python backend/.venv/Scripts/python.exe -r backend/requirements
 npm.cmd ci --no-audit --no-fund
 ```
 
-Copy environment examples once:
+Copy environment examples once, then set secrets only in the backend file or deployment secret manager:
 
 ```powershell
 if (-not (Test-Path backend/.env)) { Copy-Item backend/.env.example backend/.env }
-if (-not (Test-Path .env.local)) { Copy-Item .env.example .env.local }
 ```
+
+Set `GROQ_API_KEY` in `backend/.env` to enable hosted Analyst Chat. `GROQ_MODEL` defaults to `openai/gpt-oss-20b` and may be changed to a model currently available to your GroqCloud account. Status checks report ready, missing credentials, rate-limited, unavailable, or request-failed. Do not copy this key into `.env.local`, a `NEXT_PUBLIC_*` variable, source control, browser storage, or frontend code. A configured Groq provider takes priority; if no Groq key exists, a ready configured local Ollama model is used.
 
 `backend/.env` defaults the SQLite database to `runtime/nexora.sqlite3` under this project. Keep secrets and deployment configuration in backend-only environment variables; never add secrets to `NEXT_PUBLIC_*` variables.
 
@@ -81,7 +83,16 @@ npm.cmd run build
 - The ML Studio uses leakage-safe scikit-learn preprocessing pipelines, fixed-seed train/test splits, and two lightweight baselines. Metrics describe the held-out split and are not a guarantee of future performance. Small, imbalanced, high-cardinality, or time-dependent datasets can make metrics unstable or unsuitable.
 - Training predictions and feature importance are returned for the active browser request; prediction rows are not retained in history. Reopen the stored dataset to train again. The analyst agent can retrieve saved aggregate training results after a process restart.
 - Data cleaning returns a derived preview and never overwrites the source upload.
-- The AI analyst is unavailable until a local Ollama server and compatible installed model are configured. It uses bounded read-only tools and does not run generated Python, SQL, or shell. Rule-based ML insights are labeled as rule-based, not generated text.
+- The AI analyst uses six bounded, read-only computed tools and never runs generated Python, SQL, or shell. It sends the question and only the selected schema/aggregate tool evidence needed for the answer; raw CSV rows and cell values are not sent. When GroqCloud is used, selected evidence is processed by that third-party provider. The chat UI discloses this before submission. For local-only processing, configure an available Ollama model and leave `GROQ_API_KEY` unset. Rule-based ML insights remain labeled as rule-based, not generated text.
+
+## Hosted GroqCloud Analyst (optional)
+
+1. Create or use a GroqCloud account and review its current models, plan, and applicable billing/rate limits. This project neither creates an account nor purchases a plan.
+2. Copy `backend/.env.example` to `backend/.env` if needed. Set `GROQ_API_KEY` in that backend-only file and optionally set `GROQ_MODEL` to an active tool-calling model accessible to your account. The default is `openai/gpt-oss-20b`; the [Groq tool-use documentation](https://console.groq.com/docs/tool-use/overview) documents function calling and supported models.
+3. Restart FastAPI. The authenticated `/api/v1/agent/status` endpoint checks credentials and model availability. Chat calls use `https://api.groq.com/openai/v1/chat/completions` with a bounded request timeout; status uses the models endpoint.
+4. In the application, reopen a dataset and select **AI Chat**. The visible privacy notice explains which computed evidence can be sent. No live Groq inference is implied by installation or tests; verify only after configuring an authorized key and reviewing provider terms.
+
+Provider response states include ready, missing credentials, rate-limited, unavailable, and request failed. Groq errors never expose or log the API key. If Groq is not configured and a local Ollama model is ready, the existing local provider remains available.
 
 ## Local Ollama (optional)
 
@@ -94,18 +105,30 @@ $env:OLLAMA_NO_CLOUD = "1"
 ollama serve
 ```
 
-Set `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REQUEST_TIMEOUT_SECONDS` in `backend/.env`. No model was downloaded by this project setup. Review a model name, download size, and available H: storage before choosing to install one. See [Ollama model storage](https://docs.ollama.com/faq#where-are-models-stored).
+Set `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REQUEST_TIMEOUT_SECONDS` in `backend/.env`. Leave `GROQ_API_KEY` blank to select local Ollama. No model was downloaded by this project setup. Review a model name, download size, and available H: storage before choosing to install one. See [Ollama model storage](https://docs.ollama.com/faq#where-are-models-stored).
 
-## PostgreSQL migration for online deployment
+## Online deployment preparation (not deployed)
 
-The current application database adapter is SQLite; PostgreSQL is **not currently a supported runtime backend**. Do not deploy this SQLite file on an ephemeral server filesystem or claim that local Ollama is available in a cloud deployment. For an online deployment, first implement and test a PostgreSQL adapter for `backend/app/database.py` (parameter binding, transactions, schema creation, timestamps, and foreign-key cascades), add a pinned PostgreSQL driver, and run the complete API test suite against PostgreSQL. Then provision PostgreSQL with TLS, migrate the `users`, `sessions`, `preferences`, `datasets`, and `analysis_history` tables using a reviewed export/import or migration script, verify row counts and foreign-key ownership, set `DATABASE_URL` server-side, and test restart/backup/restore and account deletion. Move the private CSV store to an authenticated, encrypted persistent volume with the same ownership, quota, integrity, and deletion guarantees. This is a documented deployment migration path, not a claim of current PostgreSQL support.
+The repository includes a Vercel project descriptor and a Render Blueprint for a free FastAPI web service. Hosted app data must be external to Render's ephemeral filesystem: use PostgreSQL and private S3-compatible object storage. `APP_ENV=production` deliberately refuses SQLite and local file storage, so a misconfigured deployment fails at startup instead of silently losing accounts or uploads.
 
-## Production readiness checklist
+### Free-tier reality check
 
-- [ ] Implement and test the PostgreSQL adapter and schema migration described above.
-- [ ] Configure HTTPS, `APP_ENV=production`, `COOKIE_SECURE=true`, and exact CORS origins.
-- [ ] Add API rate limits for signup/login and upload/training endpoints; monitor authentication and upload failures.
-- [ ] Configure database backups, restore drills, retention, and operational alerting.
-- [ ] Review privacy policy, account deletion behavior, security headers, and deployment secrets.
-- [ ] If using Ollama, deploy a private reachable Ollama host with an H:-equivalent persistent model volume; verify networking and model availability. Cloud deployments do not automatically have access to a workstation's local Ollama service.
-- [ ] Run the production build and a browser smoke test against the final deployment.
+- [Vercel Hobby](https://vercel.com/docs/plans/hobby) is free for personal, non-commercial use and has usage limits; it is not a general free commercial hosting plan.
+- [Render free web services](https://render.com/docs/free) sleep after 15 minutes idle, may take about a minute to wake, have an ephemeral filesystem, and use up to 750 free instance hours per workspace monthly. Free Render Postgres expires after 30 days, so it is not a durable database choice. High outbound traffic to external databases or object storage can also trigger suspension.
+- [Neon Free](https://neon.com/blog/neon-free-plan-1-gb-per-project) currently includes 1 GB per project and bounded compute; free compute can run out or sleep. Check the current provider dashboard before relying on it.
+- [Cloudflare R2](https://developers.cloudflare.com/r2/pricing/) currently includes 10 GB-month standard storage, 1 million Class A requests, and 10 million Class B requests monthly. Usage beyond that is billable, and [creating an R2 subscription requires a checkout flow](https://developers.cloudflare.com/r2/get-started/). Do not enable it unless you can ensure account setup and usage stay within your no-purchase constraint; this repo cannot enforce a provider billing cap.
+
+These tiers are suitable for a constrained personal demo, not a reliability or zero-cost guarantee. No service account was created and no deployment was performed. If “no purchasing” means no payment method/checkout at all, R2 may be unavailable; choose a genuinely no-cost compatible object store or keep deployment blocked rather than use ephemeral disk.
+
+### Configure and deploy when ready
+
+1. Create a Vercel project from this repository with the Next.js root at the repository root. Set `NEXT_PUBLIC_API_URL` to the HTTPS FastAPI URL ending in `/api/v1`. This is a public API address, never a secret.
+2. Create a PostgreSQL database with TLS and backups. Set its SQLAlchemy-compatible `DATABASE_URL` only in the API host's server-side environment. Existing H: SQLite data is not copied automatically: keep it intact and plan an explicit, reviewed export/import with row counts and password/session handling before switching users.
+3. Create a private S3-compatible bucket and restricted application credentials. For Cloudflare R2, configure endpoint `https://<account-id>.r2.cloudflarestorage.com`, region `auto`, bucket name, access key, and secret key. Do not enable public bucket access. R2 encrypts objects at rest; credentials stay only in the backend environment.
+4. Create a Render Web Service using the included `render.yaml`. Set the prompted secret values in Render: `CORS_ORIGINS` to the exact frontend origin, `DATABASE_URL`, `OBJECT_STORAGE_BUCKET`, `OBJECT_STORAGE_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`; set `GROQ_API_KEY` only if hosted Analyst Chat is wanted. Confirm `STORAGE_BACKEND=s3`, `COOKIE_SECURE=true`, and `COOKIE_SAMESITE=none` remain set. Do not put API secrets in Vercel variables or any `NEXT_PUBLIC_*` variable.
+5. For authentication across the separate frontend and API origins, use HTTPS custom hostnames under the same registrable domain (such as `app.example.com` and `api.example.com`). Keep exact origin allowlisting. `SameSite=None; Secure` permits cross-site cookie sending, but browsers can block third-party cookies entirely when the two default hostnames are on different sites.
+6. Check `/api/v1/health`, signup/login/logout, upload/reopen/download/delete, ownership isolation, database restart persistence, and storage restart persistence before inviting users. Keep the H: SQLite file and uploads as the untouched local copy until a migration is verified.
+
+Required production variables are listed in [backend/.env.example](backend/.env.example); the frontend public API variable is in [.env.example](.env.example). The API validates the PostgreSQL, S3, CORS, and cookie configuration at startup and returns a generic 503 health response without connection details when PostgreSQL is unavailable. Schema setup is additive and idempotent (`schema_migrations` version 1); it does not remove or alter existing user rows.
+
+Remaining manual setup: choose providers and regions, confirm account eligibility and free quotas, provision database and private bucket, provide credentials securely, configure same-site custom DNS domains, review the existing local data migration plan, and validate actual production behavior. Add rate limiting, backups/restore drills, monitoring, privacy/retention policy, and provider-specific billing alerts before real users. GroqCloud remains optional and may involve separate provider terms or billing; local Ollama is not available to hosted Render by default. No Ollama model downloads or paid AI APIs were added.

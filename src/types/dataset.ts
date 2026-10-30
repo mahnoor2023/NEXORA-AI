@@ -78,7 +78,8 @@ export interface MLTrainingResult {
 }
 
 export type AnalystStatus = {
-  state: "ready" | "ollama_unavailable" | "model_unavailable" | "configuration_error";
+  state: "ready" | "missing_credentials" | "rate_limited" | "unavailable" | "request_failed" | "ollama_unavailable" | "model_unavailable" | "configuration_error";
+  provider?: "groq" | "ollama_local";
   model: string | null;
   message: string;
 };
@@ -90,7 +91,7 @@ export interface AgentCitation {
 
 export interface AgentChatResult {
   status: "complete";
-  provider: "ollama_local";
+  provider: "groq" | "ollama_local";
   model: string;
   answer: string;
   citations: AgentCitation[];

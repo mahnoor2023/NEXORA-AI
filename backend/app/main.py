@@ -16,10 +16,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.agent import AgentError, MAX_AGENT_SECONDS, MAX_ML_COLUMNS, MAX_ML_ROWS, ollama_base_url, ollama_status, run_data_analyst_agent
+from app.agent import AgentError, GROQ_BASE_URL, MAX_AGENT_SECONDS, MAX_ML_COLUMNS, MAX_ML_ROWS, _groq_chat, _groq_key, _ollama_chat, groq_status, ollama_base_url, ollama_status, run_data_analyst_agent
 from app.ml import MAX_TRAIN_SECONDS, MLValidationError, train_and_evaluate
 from app.state import forget_user_training_results, remember_training_result, retrieve_training_result
 from app import database
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
@@ -30,7 +31,7 @@ TRAINING_LOCK = threading.Lock()
 AGENT_LOCK = threading.Lock()
 
 app = FastAPI(title="NEXORA AI API", version="0.1.0", description="Local-first data exploration API")
-origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
+origins = [item.strip().rstrip("/") for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"], allow_headers=["*"])
 
 
@@ -44,6 +45,19 @@ async def enforce_browser_origin(request: Request, call_next):
 
 @app.on_event("startup")
 def startup() -> None:
+    production = os.getenv("APP_ENV", "development").lower() == "production"
+    same_site = os.getenv("COOKIE_SAMESITE", "none" if production else "lax").lower()
+    secure = os.getenv("COOKIE_SECURE", str(production)).lower() == "true"
+    if same_site not in {"lax", "strict", "none"}:
+        raise RuntimeError("COOKIE_SAMESITE must be lax, strict, or none")
+    if same_site == "none" and not secure:
+        raise RuntimeError("COOKIE_SECURE=true is required when COOKIE_SAMESITE=none")
+    if production and (not origins or "*" in origins):
+        raise RuntimeError("Production requires explicit CORS_ORIGINS; wildcard origins cannot use session cookies")
+    if production and os.getenv("STORAGE_BACKEND", "local").lower() == "local":
+        raise RuntimeError("Production requires persistent object storage; set STORAGE_BACKEND=s3")
+    if production and not (database.DATABASE_URL or os.getenv("DATABASE_URL", "").strip()).startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+        raise RuntimeError("Production requires DATABASE_URL configured for PostgreSQL")
     database.initialize()
 
 
@@ -115,13 +129,15 @@ User = Annotated[dict[str, str], Depends(current_user)]
 def issue_cookie(response: Response, token: str) -> None:
     secure_default = os.getenv("APP_ENV", "development").lower() == "production"
     secure = os.getenv("COOKIE_SECURE", str(secure_default)).lower() == "true"
-    response.set_cookie(database.COOKIE_NAME, token, max_age=database.SESSION_DAYS * 86400, httponly=True, secure=secure, samesite="lax", path="/")
+    same_site = os.getenv("COOKIE_SAMESITE", "none" if secure else "lax").lower()
+    response.set_cookie(database.COOKIE_NAME, token, max_age=database.SESSION_DAYS * 86400, httponly=True, secure=secure, samesite=same_site, path="/")
 
 
 def clear_cookie(response: Response) -> None:
     secure_default = os.getenv("APP_ENV", "development").lower() == "production"
     secure = os.getenv("COOKIE_SECURE", str(secure_default)).lower() == "true"
-    response.delete_cookie(database.COOKIE_NAME, path="/", httponly=True, secure=secure, samesite="lax")
+    same_site = os.getenv("COOKIE_SAMESITE", "none" if secure else "lax").lower()
+    response.delete_cookie(database.COOKIE_NAME, path="/", httponly=True, secure=secure, samesite=same_site)
 
 
 @app.post("/api/v1/auth/signup")
@@ -134,7 +150,7 @@ def signup(payload: Signup, response: Response) -> dict[str, Any]:
             db.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)", (user_id, payload.email, payload.display_name, password_hash, salt, timestamp, timestamp))
             db.execute("INSERT INTO preferences VALUES(?,?,?)", (user_id, json_module.dumps({"default_view": "overview", "compact_tables": False}), timestamp))
             token = database.create_session(db, user_id)
-    except sqlite3.IntegrityError:
+    except (IntegrityError, sqlite3.IntegrityError):
         raise HTTPException(status_code=409, detail="An account with this email already exists.") from None
     issue_cookie(response, token)
     return {"user": {"id": user_id, "email": payload.email, "display_name": payload.display_name, "created_at": timestamp}}
@@ -276,8 +292,14 @@ def delete_dataset(dataset_id: str, user: User) -> dict[str, bool]:
 
 
 @app.get("/api/v1/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> JSONResponse:
+    try:
+        with database.connect() as db:
+            db.execute("SELECT 1").fetchone()
+        return JSONResponse({"status": "ok"})
+    except Exception:
+        # Do not include connection strings or provider error details in health output.
+        return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
 
 
 async def read_csv_upload(file: UploadFile, row_limit: int = MAX_ROWS) -> tuple[bytes, pd.DataFrame]:
@@ -436,7 +458,12 @@ async def train_dataset(
 
 @app.get("/api/v1/agent/status")
 async def analyst_agent_status(user: User) -> dict[str, Any]:
-    return ollama_status()
+    if _groq_key():
+        return groq_status()
+    if os.getenv("OLLAMA_MODEL", "").strip():
+        local_status = ollama_status()
+        return {**local_status, "provider": "ollama_local"}
+    return groq_status()
 
 
 @app.post("/api/v1/agent/chat")
@@ -447,10 +474,10 @@ async def analyst_agent_chat(
 ) -> JSONResponse:
     if not question.strip() or len(question) > 1_000:
         raise HTTPException(status_code=422, detail={"code": "INVALID_QUESTION", "message": "Question must contain 1 to 1,000 characters."})
-    status = ollama_status()
+    status = await analyst_agent_status(user)
     if status["state"] != "ready":
-        status_codes = {"ollama_unavailable": "OLLAMA_UNAVAILABLE", "model_unavailable": "OLLAMA_MODEL_UNAVAILABLE", "configuration_error": "OLLAMA_CONFIGURATION_ERROR"}
-        code = status_codes.get(status["state"], "OLLAMA_UNAVAILABLE")
+        status_codes = {"missing_credentials": "GROQ_MISSING_CREDENTIALS", "rate_limited": "GROQ_RATE_LIMITED", "unavailable": "GROQ_UNAVAILABLE", "request_failed": "GROQ_REQUEST_FAILED", "ollama_unavailable": "OLLAMA_UNAVAILABLE", "model_unavailable": "OLLAMA_MODEL_UNAVAILABLE", "configuration_error": "OLLAMA_CONFIGURATION_ERROR"}
+        code = status_codes.get(status["state"], "GROQ_UNAVAILABLE")
         raise HTTPException(status_code=503, detail={"code": code, "message": status["message"]})
     filename = file.filename or "upload.csv"
     raw, df = await read_csv_upload(file, MAX_ML_ROWS)
@@ -458,17 +485,12 @@ async def analyst_agent_chat(
         raise HTTPException(status_code=413, detail={"code": "ANALYSIS_ERROR", "message": f"Agent analysis is limited to {MAX_ML_COLUMNS} columns."})
     if not AGENT_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=429, detail={"code": "AGENT_BUSY", "message": "An analyst question is already being processed. Retry when it finishes."})
-    worker = asyncio.create_task(
-        asyncio.to_thread(
-            run_data_analyst_agent,
-            question,
-            df,
-            filename,
-            _training_result_for_user(user["id"], raw),
-            status["model"],
-            ollama_base_url(),
-        )
-    )
+    hosted = status.get("provider") == "groq"
+    worker = asyncio.create_task(asyncio.to_thread(
+        run_data_analyst_agent, question, df, filename, _training_result_for_user(user["id"], raw),
+        status["model"], GROQ_BASE_URL if hosted else ollama_base_url(),
+        chat_call=_groq_chat if hosted else _ollama_chat, provider="groq" if hosted else "ollama_local",
+    ))
     try:
         result = await asyncio.wait_for(asyncio.shield(worker), timeout=MAX_AGENT_SECONDS + 5)
     except asyncio.TimeoutError:
@@ -476,7 +498,7 @@ async def analyst_agent_chat(
         raise HTTPException(status_code=408, detail={"code": "AGENT_TIMEOUT", "message": "The analyst agent exceeded its execution time limit."}) from None
     except AgentError as exc:
         AGENT_LOCK.release()
-        status_code = 503 if exc.code.startswith("OLLAMA_") else 408 if exc.code == "AGENT_TIMEOUT" else 422 if exc.code in {"INVALID_QUESTION", "INVALID_TOOL_ARGUMENTS", "TOOL_CALL_LIMIT", "ANALYSIS_ERROR", "TOOL_RESULT_LIMIT"} else 502
+        status_code = 429 if exc.code == "GROQ_RATE_LIMITED" else 503 if exc.code.startswith(("OLLAMA_", "GROQ_")) else 408 if exc.code == "AGENT_TIMEOUT" else 422 if exc.code in {"INVALID_QUESTION", "INVALID_TOOL_ARGUMENTS", "TOOL_CALL_LIMIT", "ANALYSIS_ERROR", "TOOL_RESULT_LIMIT"} else 502
         raise HTTPException(status_code=status_code, detail={"code": exc.code, "message": str(exc)}) from None
     except asyncio.CancelledError:
         worker.add_done_callback(lambda _: AGENT_LOCK.release())

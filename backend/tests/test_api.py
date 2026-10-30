@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import json
 import pytest
 import pandas as pd
 
@@ -116,6 +117,17 @@ def test_dataset_deletion_removes_file_and_analysis_history() -> None:
     assert owner.get("/api/v1/datasets/history").json()["history"] == []
 
 
+def test_dataset_history_returns_sqlalchemy_row_mappings() -> None:
+    uploaded = client.post("/api/v1/datasets/analyze", files={"file": ("history.csv", b"x,y\n1,2\n3,4\n", "text/csv")})
+    assert uploaded.status_code == 200
+    response = client.get("/api/v1/datasets/history")
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["filename"] == "history.csv"
+    assert history[0]["summary"]["row_count"] == 2
+
+
 def test_account_deletion_removes_private_source_files() -> None:
     owner = TestClient(app)
     _signup(owner, "delete-account-files@example.test")
@@ -128,7 +140,7 @@ def test_account_deletion_removes_private_source_files() -> None:
     assert deleted.status_code == 200
     assert not path.exists()
     with database.connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM users WHERE id=?", (user_id,)).fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) AS total FROM users WHERE id=?", (user_id,)).fetchone()["total"] == 0
 
 
 def test_legacy_metadata_migrates_without_claiming_csv_is_available(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,6 +169,91 @@ def test_protected_routes_and_cross_origin_writes_are_rejected() -> None:
     assert anonymous.post("/api/v1/datasets/analyze", files={"file": ("a.csv", b"x\n1\n", "text/csv")}).status_code == 401
     denied = anonymous.post("/api/v1/auth/signup", headers={"Origin": "https://attacker.invalid"}, json={"email": "origin@example.test", "display_name": "Origin", "password": "Correct-Horse-7!"})
     assert denied.status_code == 403
+
+
+def test_cross_site_cookie_configuration_is_applied_and_requires_secure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COOKIE_SECURE", "true")
+    monkeypatch.setenv("COOKIE_SAMESITE", "none")
+    user = TestClient(app, base_url="https://testserver")
+    response = user.post("/api/v1/auth/signup", json={"email": "cookie@example.test", "display_name": "Cookie", "password": "Correct-Horse-7!"})
+    assert response.status_code == 200
+    cookie = response.headers["set-cookie"].lower()
+    assert "secure" in cookie and "httponly" in cookie and "samesite=none" in cookie
+    assert user.get("/api/v1/auth/me").status_code == 200
+
+
+def test_storage_identifiers_are_uuid_scoped_and_local_objects_are_private(tmp_path) -> None:
+    from app.storage import LocalStorage
+    store = LocalStorage(tmp_path / "objects")
+    key = "a1dc2e54-5d0b-4de3-9d80-c20c4d7ea2db"
+    store.put(key, b"secret,csv\n1,2\n")
+    assert store.get(key) == b"secret,csv\n1,2\n"
+    assert list((tmp_path / "objects").iterdir()) == [tmp_path / "objects" / "a1dc2e545d0b4de39d80c20c4d7ea2db.csv"]
+    with pytest.raises(KeyError):
+        store.get("../../outside")
+    store.delete(key)
+    assert not list((tmp_path / "objects").iterdir())
+
+
+def test_s3_storage_uses_private_uuid_object_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    import boto3
+    from app.storage import S3Storage
+
+    class MissingObject(Exception):
+        pass
+
+    class Exceptions:
+        NoSuchKey = MissingObject
+
+    class Body:
+        def __init__(self, content: bytes):
+            self.content = content
+            self.closed = False
+        def read(self):
+            return self.content
+        def close(self):
+            self.closed = True
+
+    class FakeS3:
+        exceptions = Exceptions
+        def __init__(self):
+            self.objects = {}
+            self.body = None
+        def put_object(self, **kwargs):
+            self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
+            assert "ACL" not in kwargs
+        def get_object(self, **kwargs):
+            content = self.objects.get((kwargs["Bucket"], kwargs["Key"]))
+            if content is None:
+                raise MissingObject()
+            self.body = Body(content)
+            return {"Body": self.body}
+        def delete_object(self, **kwargs):
+            self.objects.pop((kwargs["Bucket"], kwargs["Key"]), None)
+
+    fake = FakeS3()
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: fake)
+    store = S3Storage("private-bucket", "auto", "https://object.example.test")
+    key = "a1dc2e54-5d0b-4de3-9d80-c20c4d7ea2db"
+    store.put(key, b"a,b\n1,2\n")
+    assert ("private-bucket", "datasets/a1dc2e545d0b4de39d80c20c4d7ea2db.csv") in fake.objects
+    assert store.get(key) == b"a,b\n1,2\n"
+    assert fake.body.closed
+    store.delete(key)
+    with pytest.raises(KeyError):
+        store.get(key)
+    with pytest.raises(KeyError):
+        store.get("../../outside")
+
+
+def test_health_fails_closed_when_database_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable():
+        raise RuntimeError("secret connection string")
+    monkeypatch.setattr(database, "connect", unavailable)
+    response = client.get("/api/v1/health")
+    assert response.status_code == 503
+    assert response.json() == {"status": "error", "database": "unavailable"}
+    assert "secret" not in response.text
 
 
 def test_account_cleanup_removes_transient_training_cache() -> None:
@@ -410,3 +507,52 @@ def test_agent_loop_dispatches_real_tools_and_validates_grounded_answer() -> Non
     assert result["status"] == "complete"
     assert result["tools_used"] == ["inspect_dataset_schema", "generate_evidence_based_summary"]
     assert result["tool_call_count"] == 2
+
+
+def test_groq_status_reports_missing_credentials_and_ready_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    missing = agent.groq_status()
+    assert missing["state"] == "missing_credentials"
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    monkeypatch.setattr(agent, "_groq_request", lambda *_args, **_kwargs: {"data": [{"id": "openai/gpt-oss-20b"}]})
+    ready = agent.groq_status()
+    assert ready["state"] == "ready"
+    assert "third-party" in ready["message"]
+
+
+def test_groq_status_distinguishes_rate_limit_and_failed_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret")
+    monkeypatch.setattr(agent, "_groq_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(AgentError("GROQ_RATE_LIMITED", "limited")))
+    assert agent.groq_status()["state"] == "rate_limited"
+    monkeypatch.setattr(agent, "_groq_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(AgentError("GROQ_REQUEST_FAILED", "denied")))
+    assert agent.groq_status()["state"] == "request_failed"
+
+
+def test_groq_tool_call_conversation_uses_call_ids_and_bounded_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret")
+    frame = pd.DataFrame({"sensitive_value": ["secret-cell-a", "secret-cell-b"], "score": [1, 2]})
+    evidence = {"generate_evidence_based_summary": [{"rows": 2, "columns_count": 2}]}
+    final_content = json.dumps({"answer": "The CSV has 2 rows.", "citations": [{"tool": "generate_evidence_based_summary", "quote": '"rows": 2'}]})
+    responses = [
+        {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call_stats_1", "type": "function", "function": {"name": "calculate_column_statistics", "arguments": "{\"column\":\"sensitive_value\"}"}}]}}]},
+        {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call_summary_2", "type": "function", "function": {"name": "generate_evidence_based_summary", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"role": "assistant", "content": final_content}}]},
+    ]
+    payloads: list[dict[str, object]] = []
+
+    def fake_provider_response(_url: str, payload: dict[str, object], _timeout: float) -> dict[str, object]:
+        payloads.append(payload)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_groq_request", fake_provider_response)
+    result = agent.run_data_analyst_agent("How many rows?", frame, "private.csv", None, "openai/gpt-oss-20b", agent.GROQ_BASE_URL, chat_call=agent._groq_chat, provider="groq")
+    assert result["provider"] == "groq"
+    assert result["tool_call_count"] == 2
+    second_messages = payloads[1]["messages"]
+    assert any(message.get("role") == "tool" and message.get("tool_call_id") == "call_stats_1" for message in second_messages)
+    assert "secret-cell-a" not in json.dumps(payloads)
+    assert payloads[0]["tools"] == agent.TOOL_DEFINITIONS
+    assert payloads[0]["tool_choice"] == "required"
+    assert payloads[0]["parallel_tool_calls"] is False
+    assert payloads[2]["response_format"]["json_schema"]["strict"] is True
