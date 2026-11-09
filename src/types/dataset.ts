@@ -78,10 +78,11 @@ export interface MLTrainingResult {
 }
 
 export type AnalystStatus = {
-  state: "ready" | "missing_credentials" | "rate_limited" | "unavailable" | "request_failed" | "ollama_unavailable" | "model_unavailable" | "configuration_error";
-  provider?: "groq" | "ollama_local";
-  model: string | null;
+  state: "ready";
+  provider: "deterministic_pandas";
+  model: null;
   message: string;
+  llm: { provider: "groq"; state: "missing_credentials" | "configured_unverified"; model: string | null; message: string };
 };
 
 export interface AgentCitation {
@@ -90,9 +91,9 @@ export interface AgentCitation {
 }
 
 export interface AgentChatResult {
-  status: "complete";
-  provider: "groq" | "ollama_local";
-  model: string;
+  status: "complete" | "unsupported";
+  provider: "deterministic_pandas";
+  model: null;
   answer: string;
   citations: AgentCitation[];
   tools_used: string[];

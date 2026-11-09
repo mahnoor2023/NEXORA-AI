@@ -53,6 +53,13 @@ def _storage():
     return get_storage(STORAGE_ROOT)
 
 
+def runtime_storage_status() -> dict[str, str]:
+    """Return safe storage labels only; never expose connection URLs, bucket names, or paths."""
+    database_kind = "PostgreSQL" if _get_engine().dialect.name == "postgresql" else "SQLite"
+    dataset_kind = "S3-compatible object storage" if not _storage().local else "local server storage"
+    return {"database": database_kind, "dataset_storage": dataset_kind}
+
+
 def _storage_path(storage_key: str) -> Path:
     from app.storage import LocalStorage
     adapter = _storage()

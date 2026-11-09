@@ -3,7 +3,7 @@ import json
 import pytest
 import pandas as pd
 
-from app import agent
+from app import agent, data_assistant
 from app.agent import AgentError
 from app.main import app
 from app import database
@@ -392,6 +392,7 @@ def test_training_rejects_invalid_target_task_and_small_dataset() -> None:
     files = {"file": ("data.csv", _regression_csv(12), "text/csv")}
     small = client.post("/api/v1/datasets/train", files=files, data={"target": "salary", "task": "auto"})
     assert small.status_code == 422
+    assert "Only 12 rows" in small.text and "at least 20" in small.text
     invalid_target = client.post(
         "/api/v1/datasets/train",
         files={"file": ("data.csv", _regression_csv(), "text/csv")},
@@ -404,6 +405,17 @@ def test_training_rejects_invalid_target_task_and_small_dataset() -> None:
         data={"target": "salary", "task": "clustering"},
     )
     assert invalid_task.status_code == 422
+
+
+def test_training_explains_high_cardinality_and_auto_selects_regression() -> None:
+    csv = ("feature,target\n" + "\n".join(f"{i % 2},{i}" for i in range(120))).encode()
+    rejected = client.post("/api/v1/datasets/train", files={"file": ("many-labels.csv", csv, "text/csv")}, data={"target": "target", "task": "classification"})
+    assert rejected.status_code == 422
+    assert "120 distinct classes" in rejected.text
+    assert "high-cardinality" in rejected.text
+    automatic = client.post("/api/v1/datasets/train", files={"file": ("continuous.csv", csv, "text/csv")}, data={"target": "target", "task": "auto"})
+    assert automatic.status_code == 200, automatic.text
+    assert automatic.json()["task"] == "regression"
 
 
 def test_training_rejects_exact_target_leakage_column() -> None:
@@ -455,26 +467,66 @@ def test_agent_rejects_invalid_tool_arguments() -> None:
         agent.dispatch_tool("execute_python", {}, frame, "x.csv")
 
 
-def test_agent_returns_explicit_ollama_unavailable_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    monkeypatch.setenv("OLLAMA_MODEL", "local-test-model")
-    monkeypatch.setattr(agent, "_request_json", lambda *args, **kwargs: (_ for _ in ()).throw(AgentError("OLLAMA_UNAVAILABLE", "Ollama offline")))
-    response = client.get("/api/v1/agent/status")
-    assert response.status_code == 200
-    assert response.json()["state"] == "ollama_unavailable"
-    chat = client.post("/api/v1/agent/chat", files={"file": ("data.csv", b"x,y\n1,2\n", "text/csv")}, data={"question": "Describe this dataset"})
-    assert chat.status_code == 503
-    assert chat.json()["detail"]["code"] == "OLLAMA_UNAVAILABLE"
+def test_deterministic_chat_works_without_provider_and_uses_saved_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr(agent, "_groq_request", lambda *_args, **_kwargs: pytest.fail("deterministic chat must not call Groq"))
+    raw = b"region,revenue,score\nEast,20,4\nWest,10,6\nEast,,8\n"
+    uploaded = client.post("/api/v1/datasets/analyze", files={"file": ("sales.csv", raw, "text/csv")})
+    dataset_id = uploaded.json()["dataset_id"]
+    status = client.get("/api/v1/agent/status").json()
+    assert status["state"] == "ready"
+    assert status["provider"] == "deterministic_pandas"
+    assert status["llm"]["state"] == "missing_credentials"
+    response = client.post("/api/v1/agent/chat", data={"dataset_id": dataset_id, "question": "top 2 region by revenue"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["provider"] == "deterministic_pandas"
+    assert body["status"] == "complete"
+    assert "East: 20" in body["answer"]
+    assert "West: 10" in body["answer"]
+    assert body["citations"][0]["quote"]
+    assert "No LLM provider was used" in body["privacy"]
 
 
-def test_agent_reports_model_unavailable_separately(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    monkeypatch.setenv("OLLAMA_MODEL", "missing-local-model")
-    monkeypatch.setattr(agent, "_request_json", lambda *args, **kwargs: {"models": [{"name": "installed-model:latest"}]})
-    response = client.get("/api/v1/agent/status")
-    assert response.status_code == 200
-    assert response.json()["state"] == "model_unavailable"
-    assert "not installed" in response.json()["message"]
+def test_deterministic_chat_is_owner_scoped_and_unsupported_is_explicit() -> None:
+    owner = TestClient(app)
+    other = TestClient(app)
+    _signup(owner, "assistant-owner@example.test")
+    _signup(other, "assistant-other@example.test")
+    uploaded = owner.post("/api/v1/datasets/analyze", files={"file": ("private.csv", b"group,value\nA,2\nB,8\n", "text/csv")})
+    dataset_id = uploaded.json()["dataset_id"]
+    denied = other.post("/api/v1/agent/chat", data={"dataset_id": dataset_id, "question": "How many rows?"})
+    assert denied.status_code == 404
+    unsupported = owner.post("/api/v1/agent/chat", data={"dataset_id": dataset_id, "question": "What should my company do next?"})
+    assert unsupported.status_code == 200
+    assert unsupported.json()["status"] == "unsupported"
+    assert unsupported.json()["citations"] == []
+    assert "I can answer" in unsupported.json()["answer"]
+
+
+def test_deterministic_pandas_answers_real_request_types() -> None:
+    frame = pd.DataFrame({"region": ["North", "South", "North", None], "revenue": [10, 20, None, 30], "units": [1, 2, 3, 4]})
+    cases = [
+        ("How many rows?", "4 rows"),
+        ("List the columns", "region, revenue, units"),
+        ("Which columns have missing values?", "2 missing values across 2 columns"),
+        ("What is the mean revenue?", "20"),
+        ("Show category frequencies for region", "North: 2"),
+        ("Top 2 regions by revenue", "South: 20"),
+        ("Summarize this dataset", "4 rows"),
+    ]
+    for question, expected in cases:
+        result = data_assistant.answer_dataset_question(question, frame, "sample.csv")
+        assert result["status"] == "complete"
+        assert expected in result["answer"]
+        assert result["provider"] == "deterministic_pandas"
+
+
+def test_runtime_status_reports_database_and_storage_mode_without_details() -> None:
+    status = client.get("/api/v1/runtime/status")
+    assert status.status_code == 200
+    assert status.json() == {"database": "SQLite", "dataset_storage": "local server storage"}
+    assert client.get("/api/v1/runtime/status").text.find(str(database.DB_PATH)) == -1
 
 
 def test_agent_loop_enforces_maximum_tool_call_limit() -> None:

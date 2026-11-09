@@ -47,7 +47,9 @@ class MLValidationError(ValueError):
 def _detect_task(target: pd.Series) -> str:
     unique = target.nunique(dropna=True)
     if is_numeric_dtype(target) and not is_bool_dtype(target):
-        return "classification" if unique <= 15 or unique / max(len(target), 1) <= 0.05 else "regression"
+        # Do not auto-classify integer identifiers or continuous targets whose
+        # class count exceeds the supported classifier limit.
+        return "classification" if unique <= 15 or (unique <= MAX_CLASSES and unique / max(len(target), 1) <= 0.05) else "regression"
     return "classification"
 
 
@@ -209,7 +211,7 @@ def train_and_evaluate(frame: pd.DataFrame, target: str, requested_task: str = "
     usable = frame.loc[original_target.notna()].copy()
     y = usable[target]
     if len(usable) < 20:
-        raise MLValidationError("At least 20 rows with a non-missing target are required.")
+        raise MLValidationError(f"Only {len(usable)} rows have a non-missing target; at least 20 are required for a train/test evaluation. Add more complete rows or choose another target.")
     if y.nunique(dropna=True) < 2:
         raise MLValidationError("The target must contain at least two distinct values.")
 
@@ -221,9 +223,12 @@ def train_and_evaluate(frame: pd.DataFrame, target: str, requested_task: str = "
         class_sizes = y.value_counts(dropna=True)
         test_rows = math.ceil(len(y) * TEST_FRACTION)
         if class_count > MAX_CLASSES:
-            raise MLValidationError(f"Classification is limited to {MAX_CLASSES} target classes.")
-        if int(class_sizes.min()) < 2 or test_rows < class_count or len(y) - test_rows < class_count:
-            raise MLValidationError("Classification needs at least two rows per class and enough rows in both split partitions.")
+            raise MLValidationError(f"Classification target has {class_count} distinct classes; the limit is {MAX_CLASSES}. This may be a high-cardinality label or identifier. Choose a lower-cardinality target, group rare labels, or select regression for a continuous numeric target.")
+        smallest_class = int(class_sizes.min())
+        if smallest_class < 2:
+            raise MLValidationError(f"The rarest class has only {smallest_class} row. Stratified evaluation requires at least two rows per class; collect more examples, combine justified rare labels, or choose another target.")
+        if test_rows < class_count or len(y) - test_rows < class_count:
+            raise MLValidationError(f"The {len(y)} usable rows produce only {test_rows} test rows, which is too few to represent all {class_count} classes in both split partitions. Use fewer classes or provide more examples per class.")
 
     features = [column for column in usable.columns if column != target]
     exact_copies = [column for column in features if usable[column].notna().all() and usable[column].eq(y).all()]

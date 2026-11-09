@@ -4,7 +4,7 @@ import AuthGate from "@/components/auth-gate";
 
 export const metadata: Metadata = {
   title: "NEXORA AI — Data workspace",
-  description: "A local-first workspace for exploring and preparing datasets.",
+  description: "Private analytics workspace for exploring datasets and evaluating machine learning models.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

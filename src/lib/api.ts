@@ -47,9 +47,9 @@ export class AgentRequestError extends Error {
   }
 }
 
-export async function askAnalyst(file: File, question: string): Promise<AgentChatResult> {
+export async function askAnalyst(datasetId: string, question: string): Promise<AgentChatResult> {
   const body = new FormData();
-  body.append("file", file);
+  body.append("dataset_id", datasetId);
   body.append("question", question);
   const response = await fetch(`${API_URL}/agent/chat`, { method: "POST", body, credentials: "include" });
   if (!response.ok) {

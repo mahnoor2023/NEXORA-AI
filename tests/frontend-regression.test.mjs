@@ -65,12 +65,23 @@ test("dataset routes preserve a selected dataset and expose reopen actions", () 
   assert.match(nav, /href:\s*"\/new-analysis"/);
 });
 
-test("AI chat exposes provider states and cloud evidence processing before submission", () => {
+test("AI chat identifies deterministic Pandas analysis and keeps LLM status separate", () => {
   const chat = readFileSync(join(sourceRoot, "components/ai-analyst-chat.tsx"), "utf8");
   const types = readFileSync(join(sourceRoot, "types/dataset.ts"), "utf8");
-  assert.match(chat, /third-party cloud AI provider/);
-  assert.match(chat, /configured local Ollama service/);
-  assert.match(chat, /GROQ_API_KEY/);
-  assert.match(chat, /GroqCloud/);
-  assert.match(types, /"missing_credentials" \| "rate_limited" \| "unavailable" \| "request_failed"/);
+  const api = readFileSync(join(sourceRoot, "lib/api.ts"), "utf8");
+  assert.match(chat, /Pandas Data Analysis Assistant/);
+  assert.match(chat, /No generative AI is used/);
+  assert.match(chat, /not been tested or used by this assistant/);
+  assert.match(chat, /askAnalyst\(datasetId, prompt\)/);
+  assert.match(api, /body\.append\("dataset_id", datasetId\)/);
+  assert.match(types, /provider: "deterministic_pandas"/);
+  assert.doesNotMatch(chat, /third-party cloud AI provider/);
+});
+
+test("dashboard reports runtime storage mode and opens chat against selected dataset", () => {
+  const dashboard = readFileSync(join(sourceRoot, "components/dashboard.tsx"), "utf8");
+  assert.match(dashboard, /\/runtime\/status/);
+  assert.match(dashboard, /storageStatus\.dataset_storage/);
+  assert.match(dashboard, /datasetId=\{datasetId!\}/);
+  assert.doesNotMatch(dashboard, /Local data workspace/);
 });

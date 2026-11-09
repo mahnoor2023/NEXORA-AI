@@ -16,7 +16,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.agent import AgentError, GROQ_BASE_URL, MAX_AGENT_SECONDS, MAX_ML_COLUMNS, MAX_ML_ROWS, _groq_chat, _groq_key, _ollama_chat, groq_status, ollama_base_url, ollama_status, run_data_analyst_agent
+from app.agent import MAX_ML_COLUMNS, MAX_ML_ROWS, _groq_key, groq_model
+from app.data_assistant import UnsupportedQuestion, answer_dataset_question
 from app.ml import MAX_TRAIN_SECONDS, MLValidationError, train_and_evaluate
 from app.state import forget_user_training_results, remember_training_result, retrieve_training_result
 from app import database
@@ -30,7 +31,7 @@ PREVIEW_ROWS = 10
 TRAINING_LOCK = threading.Lock()
 AGENT_LOCK = threading.Lock()
 
-app = FastAPI(title="NEXORA AI API", version="0.1.0", description="Local-first data exploration API")
+app = FastAPI(title="NEXORA AI API", version="0.1.0", description="Private data analytics API")
 origins = [item.strip().rstrip("/") for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"], allow_headers=["*"])
 
@@ -302,6 +303,12 @@ async def health() -> JSONResponse:
         return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
 
 
+@app.get("/api/v1/runtime/status")
+def runtime_status(user: User) -> dict[str, str]:
+    """Authenticated deployment mode, without disclosing any secret infrastructure details."""
+    return database.runtime_storage_status()
+
+
 async def read_csv_upload(file: UploadFile, row_limit: int = MAX_ROWS) -> tuple[bytes, pd.DataFrame]:
     filename = file.filename or "upload.csv"
     if not filename.lower().endswith(".csv"):
@@ -458,54 +465,63 @@ async def train_dataset(
 
 @app.get("/api/v1/agent/status")
 async def analyst_agent_status(user: User) -> dict[str, Any]:
-    if _groq_key():
-        return groq_status()
-    if os.getenv("OLLAMA_MODEL", "").strip():
-        local_status = ollama_status()
-        return {**local_status, "provider": "ollama_local"}
-    return groq_status()
+    configured_llm = bool(_groq_key())
+    return {
+        "state": "ready",
+        "provider": "deterministic_pandas",
+        "model": None,
+        "message": "Pandas Data Analysis Assistant is ready. It computes supported answers directly from your saved dataset and does not require an LLM.",
+        "llm": {
+            "provider": "groq",
+            "state": "configured_unverified" if configured_llm else "missing_credentials",
+            "model": groq_model() if configured_llm else None,
+            "message": "Optional Groq credentials are configured but have not been tested or used by deterministic chat." if configured_llm else "Optional hosted LLM is not configured. Deterministic Pandas analysis remains available.",
+        },
+    }
 
 
 @app.post("/api/v1/agent/chat")
 async def analyst_agent_chat(
-    file: Annotated[UploadFile, File()],
+    dataset_id: Annotated[str, Form()],
     question: Annotated[str, Form()],
     user: User,
 ) -> JSONResponse:
     if not question.strip() or len(question) > 1_000:
         raise HTTPException(status_code=422, detail={"code": "INVALID_QUESTION", "message": "Question must contain 1 to 1,000 characters."})
-    status = await analyst_agent_status(user)
-    if status["state"] != "ready":
-        status_codes = {"missing_credentials": "GROQ_MISSING_CREDENTIALS", "rate_limited": "GROQ_RATE_LIMITED", "unavailable": "GROQ_UNAVAILABLE", "request_failed": "GROQ_REQUEST_FAILED", "ollama_unavailable": "OLLAMA_UNAVAILABLE", "model_unavailable": "OLLAMA_MODEL_UNAVAILABLE", "configuration_error": "OLLAMA_CONFIGURATION_ERROR"}
-        code = status_codes.get(status["state"], "GROQ_UNAVAILABLE")
-        raise HTTPException(status_code=503, detail={"code": code, "message": status["message"]})
-    filename = file.filename or "upload.csv"
-    raw, df = await read_csv_upload(file, MAX_ML_ROWS)
+    try:
+        raw, filename, _ = database.dataset_source(user["id"], dataset_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": "Dataset not found."}) from None
+    except database.DatasetUnavailableError as exc:
+        raise HTTPException(status_code=409, detail={"code": "DATASET_UNAVAILABLE", "message": str(exc)}) from None
+    try:
+        df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", on_bad_lines="error", nrows=MAX_ML_ROWS + 1)
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=422, detail={"code": "INVALID_DATASET", "message": "The saved CSV could not be parsed for analysis."}) from None
+    if len(df) > MAX_ML_ROWS:
+        raise HTTPException(status_code=413, detail={"code": "ANALYSIS_ERROR", "message": f"Analysis is limited to {MAX_ML_ROWS:,} rows."})
     if len(df.columns) > MAX_ML_COLUMNS:
-        raise HTTPException(status_code=413, detail={"code": "ANALYSIS_ERROR", "message": f"Agent analysis is limited to {MAX_ML_COLUMNS} columns."})
+        raise HTTPException(status_code=413, detail={"code": "ANALYSIS_ERROR", "message": f"Analysis is limited to {MAX_ML_COLUMNS} columns."})
     if not AGENT_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=429, detail={"code": "AGENT_BUSY", "message": "An analyst question is already being processed. Retry when it finishes."})
-    hosted = status.get("provider") == "groq"
-    worker = asyncio.create_task(asyncio.to_thread(
-        run_data_analyst_agent, question, df, filename, _training_result_for_user(user["id"], raw),
-        status["model"], GROQ_BASE_URL if hosted else ollama_base_url(),
-        chat_call=_groq_chat if hosted else _ollama_chat, provider="groq" if hosted else "ollama_local",
-    ))
+    worker = asyncio.create_task(asyncio.to_thread(answer_dataset_question, question, df, filename))
     try:
-        result = await asyncio.wait_for(asyncio.shield(worker), timeout=MAX_AGENT_SECONDS + 5)
+        result = await asyncio.wait_for(asyncio.shield(worker), timeout=5)
     except asyncio.TimeoutError:
         worker.add_done_callback(lambda _: AGENT_LOCK.release())
-        raise HTTPException(status_code=408, detail={"code": "AGENT_TIMEOUT", "message": "The analyst agent exceeded its execution time limit."}) from None
-    except AgentError as exc:
+        raise HTTPException(status_code=408, detail={"code": "ANALYSIS_TIMEOUT", "message": "The Pandas analysis exceeded its execution limit. Try a smaller or more focused request."}) from None
+    except UnsupportedQuestion as exc:
         AGENT_LOCK.release()
-        status_code = 429 if exc.code == "GROQ_RATE_LIMITED" else 503 if exc.code.startswith(("OLLAMA_", "GROQ_")) else 408 if exc.code == "AGENT_TIMEOUT" else 422 if exc.code in {"INVALID_QUESTION", "INVALID_TOOL_ARGUMENTS", "TOOL_CALL_LIMIT", "ANALYSIS_ERROR", "TOOL_RESULT_LIMIT"} else 502
-        raise HTTPException(status_code=status_code, detail={"code": exc.code, "message": str(exc)}) from None
+        return JSONResponse(status_code=200, content={"status": "unsupported", "provider": "deterministic_pandas", "model": None, "answer": str(exc), "citations": [], "tools_used": [], "tool_call_count": 0, "dataset": {"filename": filename, "rows": len(df), "columns": len(df.columns)}, "privacy": "No LLM provider was used."})
+    except ValueError as exc:
+        AGENT_LOCK.release()
+        raise HTTPException(status_code=422, detail={"code": "INVALID_ANALYSIS", "message": str(exc)}) from None
     except asyncio.CancelledError:
         worker.add_done_callback(lambda _: AGENT_LOCK.release())
         raise
     except Exception:
         AGENT_LOCK.release()
-        raise HTTPException(status_code=502, detail={"code": "AGENT_ANALYSIS_ERROR", "message": "The analyst agent could not complete this request."}) from None
+        raise HTTPException(status_code=422, detail={"code": "ANALYSIS_ERROR", "message": "Pandas could not complete this analysis request."}) from None
     else:
         AGENT_LOCK.release()
     return JSONResponse(result)

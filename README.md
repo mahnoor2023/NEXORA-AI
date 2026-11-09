@@ -1,6 +1,6 @@
 # NEXORA AI
 
-NEXORA AI is a full-stack data analysis workspace built with Next.js, TypeScript, FastAPI, Pandas, scikit-learn, and SQLAlchemy. It supports account signup/login, persistent owner-scoped CSV profiling and safe cleaning, supervised baseline ML, and a bounded AI analyst that can use GroqCloud or optional local Ollama. SQLite and private H: local file storage remain the development defaults; PostgreSQL and private S3-compatible storage are configurable for hosted environments.
+NEXORA AI is a full-stack business analytics workspace built with Next.js, TypeScript, FastAPI, Pandas, scikit-learn, and SQLAlchemy. It supports account signup/login, persistent owner-scoped CSV profiling and safe cleaning, supervised baseline ML, and a deterministic Pandas Data Analysis Assistant. SQLite and private H: local file storage remain the development defaults; PostgreSQL and private S3-compatible storage are configurable for hosted environments.
 
 ## What persists
 
@@ -12,8 +12,8 @@ Passwords use PBKDF2-HMAC-SHA256 with per-account random salts. Sessions use ran
 
 - Node.js 20.9+
 - `uv` and Python 3.12
-- Hosted Analyst Chat is optional and uses GroqCloud only when `GROQ_API_KEY` is configured on the backend. The default `GROQ_MODEL` is `openai/gpt-oss-20b`; Groq lists it as a production model with tool use and JSON mode. Confirm your account can access the selected model in the [Groq models documentation](https://console.groq.com/docs/models). No API key is required or accepted by the frontend.
-- Ollama and an already-installed local tool-calling model remain optional. NEXORA does not install Ollama or download models.
+- Dataset chat is available without an API key. It uses deterministic Pandas operations for counts, columns, missing values, summaries, category frequencies, numeric aggregations, and top-N groups. Unsupported or ambiguous requests receive a clear clarification response. It is not generative AI.
+- GroqCloud and Ollama adapters remain optional integrations, but Dataset Chat does not call either provider. A configured Groq key is reported as configured but unverified; no status request or chat request sends data to Groq. NEXORA does not install Ollama or download models.
 
 ## Install on H:
 
@@ -38,7 +38,7 @@ Copy environment examples once, then set secrets only in the backend file or dep
 if (-not (Test-Path backend/.env)) { Copy-Item backend/.env.example backend/.env }
 ```
 
-Set `GROQ_API_KEY` in `backend/.env` to enable hosted Analyst Chat. `GROQ_MODEL` defaults to `openai/gpt-oss-20b` and may be changed to a model currently available to your GroqCloud account. Status checks report ready, missing credentials, rate-limited, unavailable, or request-failed. Do not copy this key into `.env.local`, a `NEXT_PUBLIC_*` variable, source control, browser storage, or frontend code. A configured Groq provider takes priority; if no Groq key exists, a ready configured local Ollama model is used.
+No API key is needed for dataset chat. Optional hosted LLM credentials remain backend-only and are not used by the deterministic assistant. Do not reuse a key previously rejected by Groq, and do not copy keys into `.env.local`, a `NEXT_PUBLIC_*` variable, source control, browser storage, or frontend code.
 
 `backend/.env` defaults the SQLite database to `runtime/nexora.sqlite3` under this project. Keep secrets and deployment configuration in backend-only environment variables; never add secrets to `NEXT_PUBLIC_*` variables.
 
@@ -83,16 +83,11 @@ npm.cmd run build
 - The ML Studio uses leakage-safe scikit-learn preprocessing pipelines, fixed-seed train/test splits, and two lightweight baselines. Metrics describe the held-out split and are not a guarantee of future performance. Small, imbalanced, high-cardinality, or time-dependent datasets can make metrics unstable or unsuitable.
 - Training predictions and feature importance are returned for the active browser request; prediction rows are not retained in history. Reopen the stored dataset to train again. The analyst agent can retrieve saved aggregate training results after a process restart.
 - Data cleaning returns a derived preview and never overwrites the source upload.
-- The AI analyst uses six bounded, read-only computed tools and never runs generated Python, SQL, or shell. It sends the question and only the selected schema/aggregate tool evidence needed for the answer; raw CSV rows and cell values are not sent. When GroqCloud is used, selected evidence is processed by that third-party provider. The chat UI discloses this before submission. For local-only processing, configure an available Ollama model and leave `GROQ_API_KEY` unset. Rule-based ML insights remain labeled as rule-based, not generated text.
+- The Pandas Data Analysis Assistant uses a bounded set of recognized request types and direct Pandas calculations against the authenticated user's saved CSV. It sends no CSV data or question to an LLM provider. It never executes generated Python, SQL, or shell and reports unsupported requests without inventing results. Chat is limited to 20,000 rows and 50 columns.
 
-## Hosted GroqCloud Analyst (optional)
+## Optional LLM integrations
 
-1. Create or use a GroqCloud account and review its current models, plan, and applicable billing/rate limits. This project neither creates an account nor purchases a plan.
-2. Copy `backend/.env.example` to `backend/.env` if needed. Set `GROQ_API_KEY` in that backend-only file and optionally set `GROQ_MODEL` to an active tool-calling model accessible to your account. The default is `openai/gpt-oss-20b`; the [Groq tool-use documentation](https://console.groq.com/docs/tool-use/overview) documents function calling and supported models.
-3. Restart FastAPI. The authenticated `/api/v1/agent/status` endpoint checks credentials and model availability. Chat calls use `https://api.groq.com/openai/v1/chat/completions` with a bounded request timeout; status uses the models endpoint.
-4. In the application, reopen a dataset and select **AI Chat**. The visible privacy notice explains which computed evidence can be sent. No live Groq inference is implied by installation or tests; verify only after configuring an authorized key and reviewing provider terms.
-
-Provider response states include ready, missing credentials, rate-limited, unavailable, and request failed. Groq errors never expose or log the API key. If Groq is not configured and a local Ollama model is ready, the existing local provider remains available.
+GroqCloud and Ollama adapter code is retained, but it is separate from and currently not connected to Dataset Chat. The authenticated status endpoint does not probe a provider; it reports only whether a Groq key is configured and labels it unverified. The deterministic assistant stays available if credentials are missing, invalid, rate-limited, or otherwise unavailable. No live Groq inference has been tested as part of this project work. Do not add a paid key or reuse the previously rejected key without separately reviewing provider account access, terms, and costs.
 
 ## Local Ollama (optional)
 
@@ -105,7 +100,7 @@ $env:OLLAMA_NO_CLOUD = "1"
 ollama serve
 ```
 
-Set `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REQUEST_TIMEOUT_SECONDS` in `backend/.env`. Leave `GROQ_API_KEY` blank to select local Ollama. No model was downloaded by this project setup. Review a model name, download size, and available H: storage before choosing to install one. See [Ollama model storage](https://docs.ollama.com/faq#where-are-models-stored).
+Ollama configuration is retained for future optional integration work, but Dataset Chat does not currently route questions to it. No model was downloaded by this project setup.
 
 ## Online deployment preparation (not deployed)
 
@@ -118,7 +113,7 @@ The repository includes a Vercel project descriptor and a Render Blueprint for a
 - [Neon Free](https://neon.com/blog/neon-free-plan-1-gb-per-project) currently includes 1 GB per project and bounded compute; free compute can run out or sleep. Check the current provider dashboard before relying on it.
 - [Cloudflare R2](https://developers.cloudflare.com/r2/pricing/) currently includes 10 GB-month standard storage, 1 million Class A requests, and 10 million Class B requests monthly. Usage beyond that is billable, and [creating an R2 subscription requires a checkout flow](https://developers.cloudflare.com/r2/get-started/). Do not enable it unless you can ensure account setup and usage stay within your no-purchase constraint; this repo cannot enforce a provider billing cap.
 
-These tiers are suitable for a constrained personal demo, not a reliability or zero-cost guarantee. No service account was created and no deployment was performed. If “no purchasing” means no payment method/checkout at all, R2 may be unavailable; choose a genuinely no-cost compatible object store or keep deployment blocked rather than use ephemeral disk.
+These tiers are suitable for constrained evaluation, not a reliability or zero-cost guarantee. No service account was created and no deployment was performed. Object storage is only active when the server's authenticated runtime status reports S3-compatible object storage; local development reports local server storage. No deployed cloud storage configuration has been verified in this work.
 
 ### Configure and deploy when ready
 
