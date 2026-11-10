@@ -11,6 +11,7 @@ from pandas.api.types import is_bool_dtype, is_numeric_dtype
 from app.ml import MAX_ML_COLUMNS, MAX_ML_ROWS
 
 MAX_TOP_N = 10
+MAX_FILTER_RESULTS = 25
 
 
 class UnsupportedQuestion(ValueError):
@@ -66,13 +67,43 @@ def _group_counts(frame: pd.DataFrame, group: str, entity_requested: bool) -> tu
     identifier = None
     if entity_requested:
         identifiers = [str(name) for name in frame.columns if re.search(r"(?:^|_)seller_(?:id|identifier|key|code)$", str(name), re.I)]
-        if len(identifiers) == 1:
+        exact_ids = [name for name in identifiers if name.casefold() == "seller_id"]
+        if len(exact_ids) == 1:
+            identifier = exact_ids[0]
+        elif len(identifiers) == 1:
             identifier = identifiers[0]
     if identifier is not None:
         counts = frame.groupby(group, dropna=False)[identifier].nunique(dropna=True)
     else:
         counts = frame[group].fillna("(missing)").astype(str).value_counts()
     return counts.sort_values(ascending=False, kind="stable"), identifier
+
+
+def _count_filter(question: str) -> tuple[str, int] | None:
+    match = re.search(
+        r"\b(fewer\s+than|less\s+than|under|more\s+than|greater\s+than|over|at\s+least|at\s+most|exactly)\s+(-?\d+(?:\.\d+)?)\b",
+        question,
+        re.I,
+    )
+    if not match:
+        return None
+    phrase, raw_threshold = match.groups()
+    try:
+        numeric_threshold = float(raw_threshold)
+    except ValueError:
+        raise UnsupportedQuestion("Use a whole-number seller count from 0 to 20,000 for a group-count filter.") from None
+    if not numeric_threshold.is_integer() or numeric_threshold < 0 or numeric_threshold > MAX_ML_ROWS:
+        raise UnsupportedQuestion("Use a whole-number seller count from 0 to 20,000 for a group-count filter.")
+    operator = {
+        "fewer than": "lt", "less than": "lt", "under": "lt",
+        "more than": "gt", "greater than": "gt", "over": "gt",
+        "at least": "ge", "at most": "le", "exactly": "eq",
+    }[re.sub(r"\s+", " ", phrase.casefold())]
+    return operator, int(numeric_threshold)
+
+
+def _safe_group_value(value: Any) -> str:
+    return str(value)[:120]
 
 
 def _numeric_columns(frame: pd.DataFrame) -> list[str]:
@@ -130,6 +161,38 @@ def answer_dataset_question(question: str, frame: pd.DataFrame, filename: str) -
         else:
             answer = "There are no missing values in this dataset."
         return _result(answer, "missing_values", evidence, filename, rows, count_columns)
+
+    count_filter = _count_filter(question)
+    if count_filter is not None:
+        operator, threshold = count_filter
+        group = _column_from(question, columns)
+        if group is None:
+            raise UnsupportedQuestion("I could not identify one grouping column for that count filter. Name the field, for example: ‘seller states with fewer than 5 sellers’.")
+        entity_requested = bool(re.search(r"\bsellers?\b", question, re.I))
+        counts, identifier = _group_counts(frame, group, entity_requested)
+        comparisons = {"lt": counts.lt, "gt": counts.gt, "ge": counts.ge, "le": counts.le, "eq": counts.eq}
+        filtered = counts.loc[comparisons[operator](threshold)]
+        shown = filtered.head(MAX_FILTER_RESULTS)
+        entity_label = f"distinct seller count ({identifier})" if identifier else "row count"
+        operator_labels = {"lt": "below", "gt": "above", "ge": "at least", "le": "at most", "eq": "exactly"}
+        operator_symbols = {"lt": "<", "gt": ">", "ge": ">=", "le": "<=", "eq": "="}
+        evidence = {
+            "group_by": group,
+            "aggregation": "distinct_entity_count" if identifier else "row_count",
+            "entity_column": identifier,
+            "comparison": operator_symbols[operator],
+            "threshold": threshold,
+            "matching_group_count": int(len(filtered)),
+            "groups": [{"value": _safe_group_value(value), "count": int(count)} for value, count in shown.items()],
+            "groups_omitted": max(0, len(filtered) - len(shown)),
+        }
+        if filtered.empty:
+            answer = f"No {group} groups have {entity_label} {operator_labels[operator]} {threshold}."
+        else:
+            labels = ", ".join(f"{_safe_group_value(value)} ({int(count)})" for value, count in shown.items())
+            extra = f"; {len(filtered) - len(shown)} additional matching groups omitted" if len(filtered) > len(shown) else ""
+            answer = f"{len(filtered)} {group} groups have {entity_label} {operator_labels[operator]} {threshold}: {labels}{extra}."
+        return _result(answer, "filtered_group_counts", evidence, filename, rows, count_columns)
 
     top_match = re.search(r"\btop\s+(\d+)\b", normalized)
     count_by_match = re.search(r"\bcount\s+(?:of\s+)?(.+?)\s+by\s+(.+?)(?:[?.!,]|$)", question, re.I)

@@ -568,6 +568,55 @@ def test_seller_group_counts_use_distinct_seller_ids_when_rows_repeat() -> None:
     assert result["citations"][0]["quote"]
 
 
+def test_group_count_filters_support_each_comparison_operator() -> None:
+    frame = pd.DataFrame({
+        "seller_id": ["sp1", "sp1", "sp2", "sp3", "sp4", "sp5", "rj1", "rj2", "rj3", "mg1", "mg2", "mg3", "mg4", "ba1", "ba2"],
+        "seller_state": ["SP"] * 6 + ["RJ"] * 3 + ["MG"] * 4 + ["BA"] * 2,
+    })
+    cases = [
+        ("Which seller states have fewer than 5 sellers?", "<", ["MG (4)", "RJ (3)", "BA (2)"]),
+        ("Which seller states have less than 5 sellers?", "<", ["MG (4)", "RJ (3)", "BA (2)"]),
+        ("Which seller states are under 5 sellers?", "<", ["MG (4)", "RJ (3)", "BA (2)"]),
+        ("Which seller states have more than 3 sellers?", ">", ["SP (5)", "MG (4)"]),
+        ("Which seller states have greater than 3 sellers?", ">", ["SP (5)", "MG (4)"]),
+        ("Which seller states have over 3 sellers?", ">", ["SP (5)", "MG (4)"]),
+        ("Which seller states have at least 4 sellers?", ">=", ["SP (5)", "MG (4)"]),
+        ("Which seller states have at most 3 sellers?", "<=", ["RJ (3)", "BA (2)"]),
+        ("Which seller states have exactly 4 sellers?", "=", ["MG (4)"]),
+    ]
+    for question, symbol, expected in cases:
+        result = data_assistant.answer_dataset_question(question, frame, "seller-counts.csv")
+        evidence = result["citations"][0]["quote"]
+        assert result["status"] == "complete", question
+        assert all(label in result["answer"] for label in expected), question
+        assert f"'comparison': '{symbol}'" in evidence, question
+        assert "'aggregation': 'distinct_entity_count'" in evidence, question
+
+
+def test_group_count_filter_empty_results_invalid_thresholds_and_output_cap() -> None:
+    frame = pd.DataFrame({"seller_id": [f"s{i}" for i in range(30)], "seller_state": [f"state-{i:02}" for i in range(30)]})
+    empty = data_assistant.answer_dataset_question("Which seller states have fewer than 0 sellers?", frame, "seller-counts.csv")
+    assert "No seller_state groups" in empty["answer"]
+    assert "'groups': []" in empty["citations"][0]["quote"]
+    for threshold in ("-1", "2.5", "20001"):
+        with pytest.raises(data_assistant.UnsupportedQuestion, match="whole-number seller count"):
+            data_assistant.answer_dataset_question(f"Which seller states have at most {threshold} sellers?", frame, "seller-counts.csv")
+    bounded = data_assistant.answer_dataset_question("Which seller states have at least 0 sellers?", frame, "seller-counts.csv")
+    assert len(bounded["citations"][0]["quote"].split("'value':")) - 1 <= data_assistant.MAX_FILTER_RESULTS
+    assert "'groups_omitted': 5" in bounded["citations"][0]["quote"]
+
+
+def test_group_count_filter_api_returns_distinct_seller_results() -> None:
+    raw = b"seller_id,seller_state\ns1,SP\ns1,SP\ns2,SP\ns3,RJ\ns4,RJ\ns5,MG\n"
+    uploaded = client.post("/api/v1/datasets/analyze", files={"file": ("seller-counts.csv", raw, "text/csv")})
+    dataset_id = uploaded.json()["dataset_id"]
+    response = client.post("/api/v1/agent/chat", data={"dataset_id": dataset_id, "question": "Which seller states have fewer than 3 sellers?"})
+    assert response.status_code == 200, response.text
+    assert "MG (1)" in response.json()["answer"]
+    assert "RJ (2)" in response.json()["answer"]
+    assert "SP (2)" in response.json()["answer"]
+
+
 def test_runtime_status_reports_database_and_storage_mode_without_details() -> None:
     status = client.get("/api/v1/runtime/status")
     assert status.status_code == 200
