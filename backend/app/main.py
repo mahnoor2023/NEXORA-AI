@@ -304,7 +304,7 @@ async def health() -> JSONResponse:
 
 
 @app.get("/api/v1/runtime/status")
-def runtime_status(user: User) -> dict[str, str]:
+def runtime_status(user: User) -> dict[str, dict[str, str]]:
     """Authenticated deployment mode, without disclosing any secret infrastructure details."""
     return database.runtime_storage_status()
 

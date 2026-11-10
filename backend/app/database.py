@@ -53,11 +53,20 @@ def _storage():
     return get_storage(STORAGE_ROOT)
 
 
-def runtime_storage_status() -> dict[str, str]:
-    """Return safe storage labels only; never expose connection URLs, bucket names, or paths."""
+def runtime_storage_status() -> dict[str, dict[str, str]]:
+    """Report effective backend configuration without exposing or probing credentials."""
     database_kind = "PostgreSQL" if _get_engine().dialect.name == "postgresql" else "SQLite"
-    dataset_kind = "S3-compatible object storage" if not _storage().local else "local server storage"
-    return {"database": database_kind, "dataset_storage": dataset_kind}
+    storage_mode = os.getenv("STORAGE_BACKEND", "local").strip().lower()
+    database_status = {"backend": database_kind, "state": "connected"}
+    if storage_mode == "local":
+        storage_status = {"backend": "local server storage", "state": "configured", "message": "Configured local file storage. It is not durable on ephemeral cloud filesystems."}
+    elif storage_mode == "s3" and os.getenv("OBJECT_STORAGE_BUCKET", "").strip():
+        storage_status = {"backend": "S3-compatible object storage", "state": "configured_unverified", "message": "Bucket configuration is present; object-store connectivity has not been tested."}
+    elif storage_mode == "s3":
+        storage_status = {"backend": "S3-compatible object storage", "state": "configuration_incomplete", "message": "STORAGE_BACKEND is S3 but the required bucket configuration is missing."}
+    else:
+        storage_status = {"backend": "unknown storage backend", "state": "configuration_error", "message": "STORAGE_BACKEND must be local or s3."}
+    return {"database": database_status, "dataset_storage": storage_status}
 
 
 def _storage_path(storage_key: str) -> Path:

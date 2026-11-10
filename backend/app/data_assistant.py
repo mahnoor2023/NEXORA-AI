@@ -27,8 +27,52 @@ def _clean_number(value: Any) -> int | float | None:
 
 
 def _column_from(text: str, columns: list[str]) -> str | None:
-    matches = [column for column in columns if re.search(rf"(?<!\w){re.escape(column)}(?!\w)", text, re.I)]
-    return max(matches, key=len) if matches else None
+    normalized_text = text.casefold().replace("_", " ")
+    matches: list[tuple[int, int, str]] = []
+    for column in columns:
+        normalized_column = column.casefold().replace("_", " ").strip()
+        aliases = {(normalized_column, 3)}
+        words = normalized_column.split()
+        if words:
+            aliases.add((" ".join(words[:-1] + [words[-1].removesuffix("s")]), 2))
+            aliases.add((normalized_column + "s", 2))
+        # A suffix such as `seller_state` can be referred to as “state” when
+        # unique, but the lower score prevents it overriding an explicit name.
+        if len(words) > 1:
+            aliases.add((words[-1].removesuffix("s"), 1))
+            aliases.add((words[-1].removesuffix("s") + "s", 1))
+        for alias, score in aliases:
+            alias = alias.strip()
+            if alias and re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", normalized_text, re.I):
+                matches.append((score, len(alias), column))
+    if not matches:
+        return None
+    best = max((score, length) for score, length, _ in matches)
+    winners = {column for score, length, column in matches if (score, length) == best}
+    return next(iter(winners)) if len(winners) == 1 else None
+
+
+def _top_n(match: re.Match[str] | None) -> int:
+    if match is None:
+        return MAX_TOP_N
+    requested = int(match.group(1))
+    if not 1 <= requested <= MAX_TOP_N:
+        raise UnsupportedQuestion(f"Top-N requests must be between 1 and {MAX_TOP_N}. Ask for a smaller number of results.")
+    return requested
+
+
+def _group_counts(frame: pd.DataFrame, group: str, entity_requested: bool) -> tuple[pd.Series, str | None]:
+    """Count unique seller identifiers when available; otherwise count dataset rows."""
+    identifier = None
+    if entity_requested:
+        identifiers = [str(name) for name in frame.columns if re.search(r"(?:^|_)seller_(?:id|identifier|key|code)$", str(name), re.I)]
+        if len(identifiers) == 1:
+            identifier = identifiers[0]
+    if identifier is not None:
+        counts = frame.groupby(group, dropna=False)[identifier].nunique(dropna=True)
+    else:
+        counts = frame[group].fillna("(missing)").astype(str).value_counts()
+    return counts.sort_values(ascending=False, kind="stable"), identifier
 
 
 def _numeric_columns(frame: pd.DataFrame) -> list[str]:
@@ -88,23 +132,49 @@ def answer_dataset_question(question: str, frame: pd.DataFrame, filename: str) -
         return _result(answer, "missing_values", evidence, filename, rows, count_columns)
 
     top_match = re.search(r"\btop\s+(\d+)\b", normalized)
-    if top_match and re.search(r"\b(group|groups|region|regions|category|categories|product|products|item|items|customer|customers|country|countries|segment|segments|rank|highest|most)\b", normalized):
-        n = min(MAX_TOP_N, max(1, int(top_match.group(1))))
+    count_by_match = re.search(r"\bcount\s+(?:of\s+)?(.+?)\s+by\s+(.+?)(?:[?.!,]|$)", question, re.I)
+    most_pattern = re.search(r"\b(?:most|highest|largest)\s+(?:number\s+of\s+)?(?P<entity>[\w -]+?)(?:[?.!,]|$)", question, re.I)
+    rank_request = top_match is not None or most_pattern is not None or count_by_match is not None
+    if rank_request:
+        n = _top_n(top_match)
         metric = None
         by_match = re.search(r"\bby\s+(.+?)(?:\s+(?:for|in|from|across)\b|[?.!,]|$)", question, re.I)
-        if by_match:
+        if count_by_match:
+            group = _column_from(count_by_match.group(2), columns)
+            if group is None:
+                raise UnsupportedQuestion("I could not match the grouping field to one dataset column. Use its column name or a unique human-friendly name.")
+            counts, identifier = _group_counts(frame, group, bool(re.search(r"seller", count_by_match.group(1), re.I)))
+            evidence = {"group_by": group, "aggregation": "distinct_entity_count" if identifier else "row_count", "entity_column": identifier, "top": [{"value": str(key), "count": int(value)} for key, value in counts.head(n).items()]}
+            labels = ", ".join(f"{item['value']}: {item['count']}" for item in evidence["top"]) or "no values"
+            measure = f"distinct sellers ({identifier})" if identifier else "rows"
+            return _result(f"Counts by {group} ({measure}): {labels}.", "grouped_entity_counts", evidence, filename, rows, count_columns)
+        if by_match and not re.fullmatch(r"(?:number\s+of\s+)?(?:sellers?|customers?|users?|orders?|records?|rows?|items?|products?|transactions?)", by_match.group(1).strip(), re.I):
             metric = _column_from(by_match.group(1), columns)
             if metric is None and by_match.group(1).strip():
-                raise UnsupportedQuestion(f"I could not match the requested ranking measure {by_match.group(1).strip()!r} to a dataset column.")
-        group_text = question[:top_match.start()] + " " + (question[by_match.end():] if by_match else "")
-        group_text = re.sub(r"\b(top|\d+|by|in|from|across|show|find|list|rank|highest|most|the|of)\b", " ", group_text, flags=re.I)
+                if not re.search(r"\b(number\s+of|count\s+of|count|sellers?|customers?|users?|orders?|records?|rows?|items?|products?|transactions?)\b", by_match.group(1), re.I):
+                    raise UnsupportedQuestion(f"I could not match the requested ranking measure {by_match.group(1).strip()!r} to a dataset column.")
+        if top_match:
+            group_end = by_match.start() if by_match else len(question)
+            group_text = question[top_match.end():group_end]
+        elif most_pattern:
+            group_text = question[:most_pattern.start("entity")] + " " + question[most_pattern.end("entity"):]
+            group_text += " " + most_pattern.group("entity")
+        else:
+            group_text = question[:count_by_match.start(1)]
+        group_text = re.sub(r"\b(top|\d+|by|in|from|across|show|find|list|rank|highest|most|the|of|number|count|how many|sellers?|customers?|users?|orders?|records?|rows?|items?|products?|transactions?)\b", " ", group_text, flags=re.I)
         group = _column_from(group_text, columns)
+        # “Which states have the most sellers?” commonly names the entity and
+        # dimension separately; use the unique matching state field in that form.
+        if group is None and most_pattern and re.search(r"\b(state|states)\b", question, re.I):
+            state_columns = [name for name in columns if re.search(r"(?:^|_)state$", name, re.I)]
+            if len(state_columns) == 1:
+                group = state_columns[0]
         if group is None:
             possible = [name for name in columns if name != metric and (not is_numeric_dtype(frame[name]) or is_bool_dtype(frame[name]))]
             if len(possible) == 1:
                 group = possible[0]
         if group is None:
-            raise UnsupportedQuestion("Name the column to group by, for example: ‘top 5 regions by revenue’.")
+            raise UnsupportedQuestion("I could not identify one grouping column. Name the dataset field, for example: ‘top 5 seller states by number of sellers’.")
         if metric:
             if not is_numeric_dtype(frame[metric]) or is_bool_dtype(frame[metric]):
                 raise UnsupportedQuestion(f"The ranking measure {metric!r} is not numeric. Choose a numeric measure or omit ‘by’ to count rows.")
@@ -113,10 +183,13 @@ def answer_dataset_question(question: str, frame: pd.DataFrame, filename: str) -
             labels = ", ".join(f"{key}: {_clean_number(value)}" for key, value in ranked.items()) or "no values"
             answer = f"Top {n} {group} groups by summed {metric}: {labels}."
         else:
-            ranked = frame[group].fillna("(missing)").astype(str).value_counts().head(n)
-            evidence = {"group_by": group, "aggregation": "row_count", "top": [{"value": str(key), "count": int(value)} for key, value in ranked.items()]}
+            entity_requested = bool(re.search(r"seller", question, re.I))
+            ranked, identifier = _group_counts(frame, group, entity_requested)
+            ranked = ranked.head(n)
+            evidence = {"group_by": group, "aggregation": "distinct_entity_count" if identifier else "row_count", "entity_column": identifier, "top": [{"value": str(key), "count": int(value)} for key, value in ranked.items()]}
             labels = ", ".join(f"{key}: {int(value)}" for key, value in ranked.items()) or "no values"
-            answer = f"Top {n} {group} groups by row count: {labels}."
+            measure = f"distinct sellers ({identifier})" if identifier else "row count"
+            answer = f"Top {n} {group} groups by {measure}: {labels}."
         return _result(answer, "top_groups", evidence, filename, rows, count_columns)
 
     frequency = re.search(r"\b(frequenc(?:y|ies)|value counts?|category counts?|distribution|breakdown|most common|categories)\b", normalized)
@@ -124,8 +197,7 @@ def answer_dataset_question(question: str, frame: pd.DataFrame, filename: str) -
         column = _column_from(question, columns)
         if column is None:
             raise UnsupportedQuestion("Name a column for category frequencies, for example: ‘show category counts for region’.")
-        top = int(top_match.group(1)) if top_match else MAX_TOP_N
-        top = min(MAX_TOP_N, max(1, top))
+        top = _top_n(top_match) if top_match else MAX_TOP_N
         values = frame[column].fillna("(missing)").astype(str).value_counts().head(top)
         evidence = {"column": column, "frequencies": [{"value": str(key), "count": int(value)} for key, value in values.items()]}
         labels = ", ".join(f"{key}: {int(value)}" for key, value in values.items()) or "no values"

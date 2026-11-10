@@ -504,16 +504,46 @@ def test_deterministic_chat_is_owner_scoped_and_unsupported_is_explicit() -> Non
     assert "I can answer" in unsupported.json()["answer"]
 
 
+def test_deterministic_chat_answers_seller_state_phrasings_through_api() -> None:
+    raw = b"seller_id,seller_state,order_total\ns-001,SP,10\ns-002,RJ,20\ns-003,SP,15\ns-004,MG,30\ns-005,RJ,12\ns-006,SP,18\n"
+    uploaded = client.post("/api/v1/datasets/analyze", files={"file": ("sellers.csv", raw, "text/csv")})
+    assert uploaded.status_code == 200, uploaded.text
+    dataset_id = uploaded.json()["dataset_id"]
+    questions = [
+        "Show the top 5 seller states by number of sellers.",
+        "Which states have the most sellers?",
+        "Count sellers by seller_state",
+        "Show category frequencies for seller_state",
+        "Which columns have missing values?",
+    ]
+    responses = [client.post("/api/v1/agent/chat", data={"dataset_id": dataset_id, "question": question}) for question in questions]
+    assert all(response.status_code == 200 for response in responses), [response.text for response in responses]
+    assert all(response.json()["status"] == "complete" for response in responses)
+    assert "SP: 3" in responses[0].json()["answer"]
+    assert "SP: 3" in responses[1].json()["answer"]
+    assert "SP: 3" in responses[2].json()["answer"]
+    assert "SP: 3" in responses[3].json()["answer"]
+    assert "no missing values" in responses[4].json()["answer"]
+
+
 def test_deterministic_pandas_answers_real_request_types() -> None:
-    frame = pd.DataFrame({"region": ["North", "South", "North", None], "revenue": [10, 20, None, 30], "units": [1, 2, 3, 4]})
+    frame = pd.DataFrame({
+        "seller_id": ["s-001", "s-002", "s-003", "s-004", "s-005", "s-006"],
+        "seller_state": ["SP", "RJ", "SP", "MG", "RJ", "SP"],
+        "region": ["South", "Southeast", "South", "Southeast", "Southeast", "South"],
+        "revenue": [10, 20, None, 30, 15, 25],
+        "units": [1, 2, 3, 4, 2, 5],
+    })
     cases = [
-        ("How many rows?", "4 rows"),
-        ("List the columns", "region, revenue, units"),
-        ("Which columns have missing values?", "2 missing values across 2 columns"),
-        ("What is the mean revenue?", "20"),
-        ("Show category frequencies for region", "North: 2"),
-        ("Top 2 regions by revenue", "South: 20"),
-        ("Summarize this dataset", "4 rows"),
+        ("How many rows are in this dataset?", "6 rows"),
+        ("List the columns", "seller_id, seller_state, region, revenue, units"),
+        ("Which columns have missing values?", "1 missing values across 1 columns"),
+        ("What is the mean revenue?", "is 20"),
+        ("Show category frequencies for seller_state", "SP: 3"),
+        ("Top 5 seller states by number of sellers", "SP: 3"),
+        ("Which states have the most sellers?", "SP: 3"),
+        ("Count sellers by seller_state", "SP: 3"),
+        ("Summarize this dataset", "6 rows"),
     ]
     for question, expected in cases:
         result = data_assistant.answer_dataset_question(question, frame, "sample.csv")
@@ -522,11 +552,42 @@ def test_deterministic_pandas_answers_real_request_types() -> None:
         assert result["provider"] == "deterministic_pandas"
 
 
+def test_deterministic_assistant_clarifies_ambiguous_group_and_enforces_top_limit() -> None:
+    frame = pd.DataFrame({"seller_state": ["SP", "RJ"], "buyer_state": ["RJ", "SP"], "seller_id": [1, 2]})
+    with pytest.raises(data_assistant.UnsupportedQuestion, match="grouping column"):
+        data_assistant.answer_dataset_question("Which states have the most sellers?", frame, "sample.csv")
+    with pytest.raises(data_assistant.UnsupportedQuestion, match="between 1 and 10"):
+        data_assistant.answer_dataset_question("Show top 100 seller states by number of sellers", frame, "sample.csv")
+
+
+def test_seller_group_counts_use_distinct_seller_ids_when_rows_repeat() -> None:
+    frame = pd.DataFrame({"seller_id": ["s1", "s1", "s2", "s3"], "seller_state": ["SP", "SP", "SP", "RJ"]})
+    result = data_assistant.answer_dataset_question("Count sellers by seller_state", frame, "orders.csv")
+    assert "SP: 2" in result["answer"]
+    assert "distinct sellers (seller_id)" in result["answer"]
+    assert result["citations"][0]["quote"]
+
+
 def test_runtime_status_reports_database_and_storage_mode_without_details() -> None:
     status = client.get("/api/v1/runtime/status")
     assert status.status_code == 200
-    assert status.json() == {"database": "SQLite", "dataset_storage": "local server storage"}
+    assert status.json()["database"] == {"backend": "SQLite", "state": "connected"}
+    assert status.json()["dataset_storage"]["backend"] == "local server storage"
     assert client.get("/api/v1/runtime/status").text.find(str(database.DB_PATH)) == -1
+
+
+def test_runtime_status_distinguishes_configured_s3_without_probing_or_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORAGE_BACKEND", "s3")
+    monkeypatch.delenv("OBJECT_STORAGE_BUCKET", raising=False)
+    incomplete = client.get("/api/v1/runtime/status").json()["dataset_storage"]
+    assert incomplete["state"] == "configuration_incomplete"
+    assert "missing" in incomplete["message"]
+    monkeypatch.setenv("OBJECT_STORAGE_BUCKET", "private-bucket")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "do-not-return-this")
+    configured = client.get("/api/v1/runtime/status").json()["dataset_storage"]
+    assert configured["state"] == "configured_unverified"
+    assert "private-bucket" not in json.dumps(configured)
+    assert "do-not-return-this" not in json.dumps(configured)
 
 
 def test_agent_loop_enforces_maximum_tool_call_limit() -> None:
