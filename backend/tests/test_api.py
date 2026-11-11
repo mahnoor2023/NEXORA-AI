@@ -64,6 +64,32 @@ def test_dataset_metadata_is_persisted_and_isolated_between_users(tmp_path) -> N
     assert restarted_client.get(f"/api/v1/datasets/{dataset_id}/source").content == b"value\n1\n2\n"
 
 
+def test_business_intelligence_profile_analysis_and_owner_isolation() -> None:
+    owner, other = TestClient(app), TestClient(app)
+    _signup(owner, "bi-owner@example.test")
+    _signup(other, "bi-other@example.test")
+    csv_data = b"order_id,order_date,quantity,unit_price,currency\no1,2025-01-01,2,3,USD\no1,2025-01-01,1,4,USD\n"
+    uploaded = owner.post("/api/v1/datasets/analyze", files={"file": ("business.csv", csv_data, "text/csv")})
+    assert uploaded.status_code == 200, uploaded.text
+    dataset_id = uploaded.json()["dataset_id"]
+    profile = owner.get(f"/api/v1/datasets/{dataset_id}/business-intelligence/profile")
+    assert profile.status_code == 200, profile.text
+    assert profile.json()["mapping_confirmed"] is False
+    assert profile.json()["mapping_inference"]["suggestions"]["order_id"]["column"] == "order_id"
+    assert other.get(f"/api/v1/datasets/{dataset_id}/business-intelligence/profile").status_code == 404
+    mapping = {
+        "order_id": "order_id", "order_date": "order_date", "quantity": "quantity", "unit_price": "unit_price",
+        "currency": "currency", "revenue_source": "quantity_x_unit_price", "granularity": "order_item",
+    }
+    result = owner.post(f"/api/v1/datasets/{dataset_id}/business-intelligence/analyze", json={"mapping": mapping})
+    assert result.status_code == 200, result.text
+    assert result.json()["metrics"]["revenue"]["value"] == 10
+    assert result.json()["metrics"]["orders"]["value"] == 1
+    assert other.post(f"/api/v1/datasets/{dataset_id}/business-intelligence/analyze", json={"mapping": mapping}).status_code == 404
+    invalid = owner.post(f"/api/v1/datasets/{dataset_id}/business-intelligence/analyze", json={"mapping": {**mapping, "order_id": "other_user_column"}})
+    assert invalid.status_code == 422
+
+
 def test_saved_csv_reopens_with_real_analysis_and_supports_training() -> None:
     owner = TestClient(app)
     _signup(owner, "reopen@example.test")

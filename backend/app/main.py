@@ -9,6 +9,8 @@ import hashlib
 import json as json_module
 import re
 import sqlite3
+from datetime import date
+from typing import Literal
 from typing import Annotated, Any
 
 import pandas as pd
@@ -17,12 +19,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import MAX_ML_COLUMNS, MAX_ML_ROWS, _groq_key, groq_model
+from app.business_intelligence import BIValidationError, MAX_BI_COLUMNS, MAX_BI_ROWS, compute_business_metrics, infer_mapping
 from app.data_assistant import UnsupportedQuestion, answer_dataset_question
 from app.ml import MAX_TRAIN_SECONDS, MLValidationError, train_and_evaluate
 from app.state import forget_user_training_results, remember_training_result, retrieve_training_result
 from app import database
 from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 MAX_COLUMNS = 200
@@ -110,6 +113,37 @@ class PreferencesUpdate(StrictModel):
 class DeleteAccount(StrictModel):
     password: str
     confirmation: str
+
+
+class BIMapping(StrictModel):
+    order_id: str = Field(min_length=1, max_length=128)
+    order_date: str | None = Field(default=None, max_length=128)
+    product_id: str | None = Field(default=None, max_length=128)
+    product_name: str | None = Field(default=None, max_length=128)
+    product_category: str | None = Field(default=None, max_length=128)
+    quantity: str | None = Field(default=None, max_length=128)
+    unit_price: str | None = Field(default=None, max_length=128)
+    line_total: str | None = Field(default=None, max_length=128)
+    order_total: str | None = Field(default=None, max_length=128)
+    revenue_amount: str | None = Field(default=None, max_length=128)
+    order_status: str | None = Field(default=None, max_length=128)
+    currency: str | None = Field(default=None, max_length=128)
+    revenue_source: Literal["line_total", "revenue_amount", "order_total", "quantity_x_unit_price"]
+    granularity: Literal["order", "order_item"]
+
+
+class BIAnalysisRequest(StrictModel):
+    mapping: BIMapping
+    start_date: date | None = None
+    end_date: date | None = None
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValueError("Start date must be on or before end date.")
+        if (self.start_date or self.end_date) and not self.mapping.order_date:
+            raise ValueError("Map an order date column before using a date range filter.")
+        return self
 
 
 def current_user(request: Request) -> dict[str, str]:
@@ -290,6 +324,53 @@ def delete_dataset(dataset_id: str, user: User) -> dict[str, bool]:
     if not database.delete_dataset_record(user["id"], dataset_id):
         raise HTTPException(status_code=404, detail="Dataset not found.")
     return {"ok": True}
+
+
+def _business_dataset_frame(dataset_id: str, user_id: str) -> tuple[str, pd.DataFrame]:
+    try:
+        raw, filename, _metadata = database.dataset_source(user_id, dataset_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Dataset not found.") from None
+    except database.DatasetUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    try:
+        frame = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", on_bad_lines="error", nrows=MAX_BI_ROWS + 1)
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=422, detail="The saved CSV could not be parsed for Business Intelligence.") from None
+    if len(frame) > MAX_BI_ROWS:
+        raise HTTPException(status_code=413, detail=f"Business Intelligence is limited to {MAX_BI_ROWS:,} rows.")
+    if len(frame.columns) > MAX_BI_COLUMNS:
+        raise HTTPException(status_code=413, detail=f"Business Intelligence is limited to {MAX_BI_COLUMNS} columns.")
+    return filename, frame
+
+
+@app.get("/api/v1/datasets/{dataset_id}/business-intelligence/profile")
+def business_intelligence_profile(dataset_id: str, user: User) -> dict[str, Any]:
+    filename, frame = _business_dataset_frame(dataset_id, user["id"])
+    return {
+        "dataset_id": dataset_id,
+        "filename": filename,
+        "row_count": int(len(frame)),
+        "column_count": int(len(frame.columns)),
+        "columns": [{"name": str(name), "dtype": str(frame[name].dtype), "missing": int(frame[name].isna().sum())} for name in frame.columns],
+        "mapping_inference": infer_mapping([str(name) for name in frame.columns]),
+        "mapping_confirmed": False,
+    }
+
+
+@app.post("/api/v1/datasets/{dataset_id}/business-intelligence/analyze")
+def analyze_business_dataset(dataset_id: str, payload: BIAnalysisRequest, user: User) -> dict[str, Any]:
+    filename, frame = _business_dataset_frame(dataset_id, user["id"])
+    try:
+        return compute_business_metrics(
+            frame,
+            filename,
+            payload.mapping.model_dump(),
+            payload.start_date,
+            payload.end_date,
+        )
+    except BIValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 @app.get("/api/v1/health")

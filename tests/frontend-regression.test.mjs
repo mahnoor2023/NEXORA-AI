@@ -85,3 +85,18 @@ test("dashboard reports runtime storage mode and opens chat against selected dat
   assert.match(dashboard, /datasetId=\{datasetId!\}/);
   assert.doesNotMatch(dashboard, /Local data workspace/);
 });
+
+test("Business Intelligence requires dataset selection and confirmed mapping before displaying computed KPIs", () => {
+  const route = readFileSync(join(sourceRoot, "app/business-intelligence/page.tsx"), "utf8");
+  const component = readFileSync(join(sourceRoot, "components/business-intelligence.tsx"), "utf8");
+  const api = readFileSync(join(sourceRoot, "lib/business-intelligence.ts"), "utf8");
+  const nav = readFileSync(join(sourceRoot, "components/app-nav.tsx"), "utf8");
+  assert.match(route, /BusinessIntelligence/);
+  assert.match(nav, /href:\s*"\/business-intelligence"/);
+  assert.match(component, /getBIProfile\(datasetId\)/);
+  assert.match(component, /Confirm mappings and calculate/);
+  assert.match(component, /No sales data or LLM-generated estimates are added/);
+  assert.match(component, /Olist tables.*not automatically joined/);
+  assert.match(api, /business-intelligence\/analyze/);
+  assert.match(component, /role="alert"/);
+});

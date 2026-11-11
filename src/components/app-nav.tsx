@@ -3,10 +3,10 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { Activity, BarChart3, Database, Grid2X2, LogOut, Plus, Settings2, Sparkles } from "lucide-react";
+import { Activity, BarChart3, Database, Grid2X2, LogOut, Plus, Settings2, Sparkles, TrendingUp } from "lucide-react";
 import { api, type User } from "@/lib/auth";
 
-const items = [{ href: "/", label: "Overview", icon: Grid2X2 }, { href: "/new-analysis", label: "New analysis", icon: Plus }, { href: "/datasets", label: "Datasets", icon: Database }, { href: "/exploration", label: "Exploration", icon: BarChart3 }, { href: "/settings", label: "Settings", icon: Settings2 }];
+const items = [{ href: "/", label: "Overview", icon: Grid2X2 }, { href: "/new-analysis", label: "New analysis", icon: Plus }, { href: "/datasets", label: "Datasets", icon: Database }, { href: "/exploration", label: "Exploration", icon: BarChart3 }, { href: "/business-intelligence", label: "Business intelligence", icon: TrendingUp }, { href: "/settings", label: "Settings", icon: Settings2 }];
 export function AppNav() {
   const pathname = usePathname(); const router = useRouter(); const [user, setUser] = useState<User | null>(null); const [menu, setMenu] = useState(false); const [actionError, setActionError] = useState("");
   useEffect(() => { api<{ user: User }>("/auth/me").then((v) => setUser(v.user)).catch(() => setUser(null)); }, [pathname]);
